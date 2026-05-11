@@ -2,26 +2,22 @@
 #define PATHBAR_H
 
 // =============================================================================
-// PathBar —— 路径栏（面包屑 + 可编辑模式）
+// PathBar —— 路径栏（当前路径显示 + 可编辑模式）
 //
 // 两个页面切换：
-//   1. 面包屑模式（默认）：把当前路径切成按钮："/ > Users > foo > bar"
-//      点击 root 跳到根；点击中间段跳到祖先；同时把目标路径复制到系统剪贴板
-//      并显示一秒钟的"已复制"小气泡（toast）。
+//   1. 显示模式（默认）：**本地路径**以可点击面包屑形式展示每一段祖先目录，
+//      点击任一段 emit pathSelected(absPrefix) → FilePanel::navigateTo 跳转；
+//      **远程 URL (sftp://...)** 原样整条只读展示，不做拆分（避免语义歧义）。
+//      SSOT 铁律不变：m_path 始终是文件视图 rootPath 的镜像，面包屑只是
+//      对 m_path 的**展示**，所有跳转依旧绕道 FilePanel::navigateTo → syncPathUI
+//      → setPath → rebuildDisplay 回来，不允许 PathBar 内部自改 m_path。
 //   2. 编辑模式：变成 QLineEdit，用户可以直接输入路径（Tab 补全暂未做）。
 //      Enter 提交，Esc/失焦取消。
-//
-// 远程 URL 处理（关键）：
-//   - 路径 sftp://user@host:22/pub/example 会被识别为：root 显示为
-//     "sftp://user@host:22/"，后面用斜杠拆出 "pub" / "example"。
-//   - 普通 split('/') 会把 "sftp:" 和 "user@host:22" 拆成奇怪的按钮，
-//     必须先问 FileSystemRouter::mountFor() 把挂载前缀整体作"根"处理。
 // =============================================================================
 
 #include <QWidget>
 #include <QHBoxLayout>
 #include <QPushButton>
-#include <QVector>
 #include <QString>
 
 class QLabel;
@@ -35,6 +31,7 @@ class PathBar : public QWidget {
 public:
     explicit PathBar(QWidget* parent = nullptr);
 
+    /// 设置当前显示路径（单一数据源：应由拥有者从"文件视图真实 rootPath"调用）。
     void setPath(const QString& path);
     QString path() const { return m_path; }
 
@@ -43,25 +40,31 @@ public:
     void exitEditMode();
 
 signals:
-    /// 用户点了某个面包屑按钮，或在编辑框 Enter 了一个有效路径
+    /// 用户点击面包屑段要求跳转到某祖先目录；或在编辑框 Enter 了一个有效路径。
+    /// FilePanel 应连到 navigateTo(path) 完成 SSOT 跳转。
     void pathSelected(const QString& path);
 
 protected:
     bool eventFilter(QObject* obj, QEvent* event) override;
 
 private:
-    void rebuildButtons();          // 根据 m_path 重建面包屑按钮
+    void rebuildDisplay();                          // 根据 m_path 重建面包屑
+    void clearCrumbs();                             // 移除当前面包屑按钮/分隔符
     void showCopiedToast(const QPoint& globalPos);  // 顶层无边框小气泡
-    void commitEditedPath();        // 编辑模式 Enter 处理
+    void commitEditedPath();                        // 编辑模式 Enter 处理
 
     QString m_path;
     QStackedLayout* m_stack = nullptr;
 
-    // ---- 面包屑页面 ----
-    QWidget* m_breadcrumbPage = nullptr;
+    // ---- 只读显示页面 ----
+    QWidget* m_displayPage = nullptr;
     QHBoxLayout* m_layout = nullptr;
-    QVector<QPushButton*> m_buttons;
-    QPushButton* m_editBtn = nullptr;   // "✎" 按钮 —— 切换到编辑模式
+    // 面包屑模式下此 label 隐藏（仅在远程 URL 时显示整条路径）
+    QPushButton* m_pathLabel = nullptr;
+    // 面包屑容器（内部由 rebuildDisplay 每次重建）
+    QWidget* m_crumbHost = nullptr;
+    QHBoxLayout* m_crumbLayout = nullptr;
+    QPushButton* m_editBtn = nullptr;    // "✎" 按钮 —— 切换到编辑模式
 
     // ---- 编辑页面 ----
     QWidget* m_editPage = nullptr;

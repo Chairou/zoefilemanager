@@ -38,6 +38,11 @@
 #include <QRegularExpression>
 #include <QDateTime>
 #include <QTimer>
+#include <QPainter>
+#include <QPixmap>
+#include <QStyle>
+#include <QPainterPath>
+#include <cmath>
 #include "I18n.h"
 #include "AppFonts.h"
 #include "SettingsDialog.h"
@@ -284,54 +289,337 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     QMainWindow::closeEvent(event);
 }
 
-// 工具栏：每个 action 都直接绑到对应槽，文本前缀的 Unicode 是图标占位。
-// 修改文本时注意保持 UTF-8 字节序列正确。
+// 辅助函数：绘制矢量图标（统一风格：1.6px 线宽，圆角，简洁几何）
+// 底色：与目录树底色一致（暗主题 #2E3440 / 亮主题 #ffffff），
+//       通过 m_isDarkTheme 标志位由调用方在主题切换时显式刷新。
+// 描边色：在该底色上对比度合适的前景色（暗主题用浅色 #D8DEE9，亮主题用深灰 #424242）
+static QIcon makeVectorIcon(std::function<void(QPainter&, int)> drawFunc, bool darkTheme, int size = 20) {
+    const QColor bgColor   = darkTheme ? QColor("#2E3440") : QColor("#ffffff");
+    const QColor lineColor = darkTheme ? QColor("#D8DEE9") : QColor("#424242");
+    QPixmap pixmap(size, size);
+    pixmap.fill(bgColor);  // 使用目录树底色作为图标底色
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform);
+    painter.setPen(QPen(lineColor, 1.6, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    drawFunc(painter, size);
+    return QIcon(pixmap);
+}
+
+// 剪切图标：剪刀形状
+static QIcon makeCutIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int cx = s / 2, cy = s / 2;
+        // 两个圆环（剪刀手柄）
+        p.drawEllipse(QPoint(cx - 4, cy - 3), 2, 2);
+        p.drawEllipse(QPoint(cx - 4, cy + 3), 2, 2);
+        // 剪刀刃
+        p.drawLine(cx - 2, cy - 3, cx + 5, cy);
+        p.drawLine(cx - 2, cy + 3, cx + 5, cy);
+    }, darkTheme, size);
+}
+
+// 粘贴图标：剪贴板
+static QIcon makePasteIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int m = s / 5;
+        // 剪贴板外框
+        p.drawRoundedRect(m, m + 2, s - 2*m, s - 2*m - 2, 2, 2);
+        // 顶部夹子
+        p.drawRect(s/2 - 2, m - 1, 4, 3);
+    }, darkTheme, size);
+}
+
+// 全选图标：带勾的方框
+static QIcon makeSelectAllIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int m = s / 5;
+        // 方框
+        p.drawRoundedRect(m, m, s - 2*m, s - 2*m, 2, 2);
+        // 勾
+        QPainterPath path;
+        path.moveTo(m + 2, s/2);
+        path.lineTo(s/2 - 1, s - m - 3);
+        path.lineTo(s - m - 2, m + 3);
+        p.drawPath(path);
+    }, darkTheme, size);
+}
+
+// 文件夹图标：简化文件夹
+static QIcon makeFolderIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int m = s / 5;
+        // 文件夹主体
+        QPainterPath path;
+        path.moveTo(m, m + 3);
+        path.lineTo(m, s - m);
+        path.lineTo(s - m, s - m);
+        path.lineTo(s - m, m + 3);
+        // 文件夹标签
+        path.lineTo(s/2 + 2, m + 3);
+        path.lineTo(s/2, m);
+        path.lineTo(m, m);
+        path.closeSubpath();
+        p.drawPath(path);
+    }, darkTheme, size);
+}
+
+// 脚本图标：齿轮
+static QIcon makeScriptIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int cx = s / 2, cy = s / 2, r = s / 4;
+        // 中心圆
+        p.drawEllipse(QPoint(cx, cy), r - 2, r - 2);
+        // 6 个齿
+        for (int i = 0; i < 6; ++i) {
+            double angle = i * M_PI / 3;
+            int x1 = cx + (r - 1) * cos(angle);
+            int y1 = cy + (r - 1) * sin(angle);
+            int x2 = cx + (r + 3) * cos(angle);
+            int y2 = cy + (r + 3) * sin(angle);
+            p.drawLine(x1, y1, x2, y2);
+        }
+    }, darkTheme, size);
+}
+
+// 眼睛图标：显示/隐藏
+static QIcon makeEyeIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int cx = s / 2, cy = s / 2;
+        // 眼睛轮廓（椭圆弧）
+        QPainterPath path;
+        path.moveTo(s/5, cy);
+        path.quadTo(cx, cy - s/4, s*4/5, cy);
+        path.quadTo(cx, cy + s/4, s/5, cy);
+        p.drawPath(path);
+        // 瞳孔
+        p.setBrush(p.pen().color());
+        p.drawEllipse(QPoint(cx, cy), 3, 3);
+    }, darkTheme, size);
+}
+
+// 月亮图标：主题切换
+static QIcon makeThemeIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int cx = s / 2 + 1, cy = s / 2, r = s / 3;
+        // 月牙（用两个圆的差集）
+        QPainterPath outer, inner;
+        outer.addEllipse(QPoint(cx, cy), r, r);
+        inner.addEllipse(QPoint(cx + r/2, cy - r/4), r, r);
+        p.fillPath(outer.subtracted(inner), QBrush(p.pen().color()));
+    }, darkTheme, size);
+}
+
+// 箭头图标：导航（方向：0=左, 1=右, 2=上）
+static QIcon makeArrowIcon(int direction, bool darkTheme, int size = 20) {
+    return makeVectorIcon([direction](QPainter& p, int s) {
+        int cx = s / 2, cy = s / 2;
+        QPainterPath path;
+        if (direction == 0) {  // 左
+            path.moveTo(cx + 3, cy - 5);
+            path.lineTo(cx - 3, cy);
+            path.lineTo(cx + 3, cy + 5);
+            p.drawPath(path);
+            p.drawLine(cx - 3, cy, cx + 5, cy);
+        } else if (direction == 1) {  // 右
+            path.moveTo(cx - 3, cy - 5);
+            path.lineTo(cx + 3, cy);
+            path.lineTo(cx - 3, cy + 5);
+            p.drawPath(path);
+            p.drawLine(cx - 5, cy, cx + 3, cy);
+        } else {  // 上
+            path.moveTo(cx - 5, cy + 3);
+            path.lineTo(cx, cy - 3);
+            path.lineTo(cx + 5, cy + 3);
+            p.drawPath(path);
+            p.drawLine(cx, cy - 3, cx, cy + 5);
+        }
+    }, darkTheme, size);
+}
+
+// 刷新图标：环形箭头
+static QIcon makeRefreshIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int cx = s / 2, cy = s / 2, r = s / 3;
+        // 3/4 圆弧
+        QRectF rect(cx - r, cy - r, 2*r, 2*r);
+        p.drawArc(rect, 30 * 16, 270 * 16);
+        // 箭头（在弧的起点处）
+        double a = 30 * M_PI / 180;
+        int ax = cx + r * cos(a);
+        int ay = cy - r * sin(a);
+        p.drawLine(ax, ay, ax - 4, ay - 1);
+        p.drawLine(ax, ay, ax - 1, ay + 4);
+    }, darkTheme, size);
+}
+
+// 复制图标：两个重叠的方框
+static QIcon makeCopyIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int m = s / 5;
+        // 后面的方框
+        p.drawRoundedRect(m, m, s - 2*m - 3, s - 2*m - 3, 1.5, 1.5);
+        // 前面的方框
+        p.drawRoundedRect(m + 3, m + 3, s - 2*m - 3, s - 2*m - 3, 1.5, 1.5);
+    }, darkTheme, size);
+}
+
+// 删除图标：垃圾桶
+static QIcon makeDeleteIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int cx = s / 2;
+        int top = s / 4 + 1;
+        int bottom = s - s / 5;
+        // 桶盖横线
+        p.drawLine(cx - 6, top, cx + 6, top);
+        // 提手
+        p.drawLine(cx - 2, top - 2, cx + 2, top - 2);
+        p.drawLine(cx - 2, top - 2, cx - 2, top);
+        p.drawLine(cx + 2, top - 2, cx + 2, top);
+        // 桶身（梯形）
+        QPainterPath body;
+        body.moveTo(cx - 5, top + 1);
+        body.lineTo(cx - 4, bottom);
+        body.lineTo(cx + 4, bottom);
+        body.lineTo(cx + 5, top + 1);
+        p.drawPath(body);
+        // 桶身竖线
+        p.drawLine(cx - 2, top + 3, cx - 2, bottom - 1);
+        p.drawLine(cx + 2, top + 3, cx + 2, bottom - 1);
+    }, darkTheme, size);
+}
+
+// 搜索图标：放大镜
+static QIcon makeSearchIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int cx = s / 2 - 2, cy = s / 2 - 2, r = s / 4;
+        // 放大镜圆圈
+        p.drawEllipse(QPoint(cx, cy), r, r);
+        // 手柄
+        p.drawLine(cx + r * 0.7, cy + r * 0.7, s - 3, s - 3);
+    }, darkTheme, size);
+}
+
+// 连接图标：相连的链环
+static QIcon makeConnectIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int cy = s / 2;
+        // 左链环
+        p.drawRoundedRect(s/5 - 1, cy - 3, 7, 6, 3, 3);
+        // 右链环
+        p.drawRoundedRect(s - s/5 - 6, cy - 3, 7, 6, 3, 3);
+        // 连接线
+        p.drawLine(s/5 + 5, cy, s - s/5 - 5, cy);
+    }, darkTheme, size);
+}
+
+// 断开图标：断开的链环
+static QIcon makeDisconnectIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int cy = s / 2;
+        // 左链环
+        p.drawRoundedRect(s/5 - 1, cy - 3, 7, 6, 3, 3);
+        // 右链环
+        p.drawRoundedRect(s - s/5 - 6, cy - 3, 7, 6, 3, 3);
+        // 断开标记（X）
+        int mx = s / 2;
+        p.drawLine(mx - 2, cy - 3, mx + 2, cy + 3);
+        p.drawLine(mx + 2, cy - 3, mx - 2, cy + 3);
+    }, darkTheme, size);
+}
+
+// 设置图标：滑块
+static QIcon makeSettingsIcon(bool darkTheme, int size = 20) {
+    return makeVectorIcon([](QPainter& p, int s) {
+        int m = s / 5;
+        int w = s - 2 * m;
+        // 三条横线 + 滑块圆点
+        int y1 = m + 1;
+        int y2 = s / 2;
+        int y3 = s - m - 1;
+        p.drawLine(m, y1, m + w, y1);
+        p.drawLine(m, y2, m + w, y2);
+        p.drawLine(m, y3, m + w, y3);
+        p.setBrush(p.pen().color());
+        p.drawEllipse(QPoint(m + w * 0.7, y1), 2, 2);
+        p.drawEllipse(QPoint(m + w * 0.3, y2), 2, 2);
+        p.drawEllipse(QPoint(m + w * 0.6, y3), 2, 2);
+    }, darkTheme, size);
+}
+
+// 工具栏：使用统一风格的矢量图标，文字作为 ToolTip 显示。
 void MainWindow::setupToolbar() {
     auto* toolbar = addToolBar("Main");
     m_toolbar = toolbar;
     toolbar->setMovable(false);
     toolbar->setIconSize(QSize(20, 20));
+    toolbar->setToolButtonStyle(Qt::ToolButtonIconOnly);
 
-    m_backAction = toolbar->addAction(T("\xE2\x86\x90 Back"), this, &MainWindow::onBack);
-    m_forwardAction = toolbar->addAction(T("\xE2\x86\x92 Fwd"), this, &MainWindow::onForward);
-    m_upAction = toolbar->addAction(T("\xE2\x86\x91 Up"), this, &MainWindow::onUp);
-    m_refreshAction = toolbar->addAction(T("\xE2\x9F\xB3 Refresh"), this, &MainWindow::onRefresh);
+    // 导航按钮：使用自绘箭头图标
+    m_backAction = toolbar->addAction(makeArrowIcon(0, m_isDarkTheme), "", this, &MainWindow::onBack);
+    m_backAction->setToolTip(T("Back"));
+    
+    m_forwardAction = toolbar->addAction(makeArrowIcon(1, m_isDarkTheme), "", this, &MainWindow::onForward);
+    m_forwardAction->setToolTip(T("Forward"));
+    
+    m_upAction = toolbar->addAction(makeArrowIcon(2, m_isDarkTheme), "", this, &MainWindow::onUp);
+    m_upAction->setToolTip(T("Up"));
+    
+    m_refreshAction = toolbar->addAction(makeRefreshIcon(m_isDarkTheme), "", this, &MainWindow::onRefresh);
+    m_refreshAction->setToolTip(T("Refresh"));
 
-    toolbar->addSeparator();
+    // 按钮之间不再插入分隔符：用户要求按钮组紧贴无缝隙（2026-05-12 调整）
+    // 文件操作：使用自定义矢量图标
+    m_copyAction = toolbar->addAction(makeCopyIcon(m_isDarkTheme), "", this, &MainWindow::onCopy);
+    m_copyAction->setToolTip(T("Copy"));
+    
+    m_cutAction = toolbar->addAction(makeCutIcon(m_isDarkTheme), "", this, &MainWindow::onCut);
+    m_cutAction->setToolTip(T("Cut"));
+    
+    m_pasteAction = toolbar->addAction(makePasteIcon(m_isDarkTheme), "", this, &MainWindow::onPaste);
+    m_pasteAction->setToolTip(T("Paste"));
+    
+    m_deleteAction = toolbar->addAction(makeDeleteIcon(m_isDarkTheme), "", this, &MainWindow::onDelete);
+    m_deleteAction->setToolTip(T("Delete"));
 
-    m_copyAction = toolbar->addAction(T("Copy"), this, &MainWindow::onCopy);
-    m_cutAction = toolbar->addAction(T("Cut"), this, &MainWindow::onCut);
-    m_pasteAction = toolbar->addAction(T("Paste"), this, &MainWindow::onPaste);
-    m_deleteAction = toolbar->addAction(T("Delete"), this, &MainWindow::onDelete);
+    // 其他操作：使用自定义矢量图标
+    m_selectAllAction = toolbar->addAction(makeSelectAllIcon(m_isDarkTheme), "", this, &MainWindow::onSelectAll);
+    m_selectAllAction->setToolTip(T("Select All"));
+    
+    m_copyPathAction = toolbar->addAction(makeFolderIcon(m_isDarkTheme), "", this, &MainWindow::onCopyPath);
+    m_copyPathAction->setToolTip(T("Copy Path"));
+    
+    m_runScriptAction = toolbar->addAction(makeScriptIcon(m_isDarkTheme), "", this, &MainWindow::onRunScript);
+    m_runScriptAction->setToolTip(T("Script"));
+    
+    m_searchAction = toolbar->addAction(makeSearchIcon(m_isDarkTheme), "", this, &MainWindow::onSearch);
+    m_searchAction->setToolTip(T("Search"));
 
-    toolbar->addSeparator();
-
-    m_selectAllAction = toolbar->addAction(T("Select All"), this, &MainWindow::onSelectAll);
-    m_copyPathAction = toolbar->addAction(T("Copy Path"), this, &MainWindow::onCopyPath);
-    m_runScriptAction = toolbar->addAction(T("Script"), this, &MainWindow::onRunScript);
-    m_searchAction = toolbar->addAction(T("Search"), this, &MainWindow::onSearch);
-
-    toolbar->addSeparator();
-
-    m_remoteConnectAction = toolbar->addAction(T("Connect"), this, &MainWindow::onRemoteConnect);
-    m_remoteDisconnectAction = toolbar->addAction(T("Disconnect"), this, &MainWindow::onRemoteDisconnect);
+    // 远程连接：使用自定义矢量图标
+    m_remoteConnectAction = toolbar->addAction(makeConnectIcon(m_isDarkTheme), "", this, &MainWindow::onRemoteConnect);
+    m_remoteConnectAction->setToolTip(T("Connect"));
+    
+    m_remoteDisconnectAction = toolbar->addAction(makeDisconnectIcon(m_isDarkTheme), "", this, &MainWindow::onRemoteDisconnect);
+    m_remoteDisconnectAction->setToolTip(T("Disconnect"));
     m_remoteDisconnectAction->setEnabled(false);
 
-    toolbar->addSeparator();
-
-    m_hiddenAction = toolbar->addAction(T("\xE2\x97\x89 Hidden"), this, &MainWindow::onToggleHidden);
+    // 显示隐藏文件
+    m_hiddenAction = toolbar->addAction(makeEyeIcon(m_isDarkTheme), "", this, &MainWindow::onToggleHidden);
     m_hiddenAction->setCheckable(true);
     m_hiddenAction->setChecked(RealFileSystem::instance().showHidden());
-    m_hiddenAction->setToolTip("Show/hide dot-files (files starting with '.')");
+    m_hiddenAction->setToolTip(T("Show/Hide Hidden Files"));
 
-    m_themeAction = toolbar->addAction(T("Theme: Dark"), this, &MainWindow::onToggleTheme);
+    // 主题切换
+    m_themeAction = toolbar->addAction(makeThemeIcon(m_isDarkTheme), "", this, &MainWindow::onToggleTheme);
+    m_themeAction->setToolTip(m_isDarkTheme ? T("Theme: Dark") : T("Theme: Light"));
 
     // 推到右侧：Settings 按钮靠最右端显示
     auto* spacer = new QWidget(toolbar);
     spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     toolbar->addWidget(spacer);
-    m_settingsAction = toolbar->addAction(T("Settings"), this, &MainWindow::onOpenSettings);
-
+    
+    m_settingsAction = toolbar->addAction(makeSettingsIcon(m_isDarkTheme), "", this, &MainWindow::onOpenSettings);
+    m_settingsAction->setToolTip(T("Settings"));
     // 语言切换时重新翻译整个 UI
     connect(&I18n::instance(), &I18n::changed,
             this, &MainWindow::retranslateUi);
@@ -345,6 +633,38 @@ void MainWindow::setupToolbar() {
     // 安装 proxy style：唯一可靠地让 toolbar 给溢出按钮分配足够宽度的方法。
     // 用 toolbar 当前的 baseStyle 派生，这样不会破坏原有的视觉风格。
     toolbar->setStyle(new ToolbarExtStyle(toolbar->style()));
+
+    // 关键：对所有 QToolButton 启用 autoRaise，关闭 native frame。
+    // 这是消除"按钮之间出现 1px 分隔线/边界感"最可靠的手段——
+    // 仅靠 QSS `border: 0px` 无法压制 mac/fusion 的 PE_FrameButtonTool primitive。
+    // setAutoRaise(true) 让 QToolButton 在非 hover/pressed 状态下完全不绘制 frame，
+    // 由 QSS 全权接管按钮外观。需要在所有 action 已添加完成后再执行。
+    for (auto* btn : toolbar->findChildren<QToolButton*>()) {
+        btn->setAutoRaise(true);
+    }
+
+    // 同步 action tooltip → button tooltip。Qt 在 action text 为空且 toolbar
+    // 被 QSS 样式化后，不会自动把 action->toolTip() 复制到内部 QToolButton，
+    // 导致鼠标悬停无提示。此处显式兜底，保证每个按钮都有中文悬浮提示。
+    syncToolbarButtonToolTips();
+}
+
+// 遍历 toolbar 上所有 QToolButton，把它们关联 QAction 的 toolTip 显式
+// setToolTip 到 button 本身（若 button 当前 toolTip 为空或与 action 不一致）。
+// 该函数需在：
+//   1) setupToolbar() 装配完成后调用一次；
+//   2) retranslateUi() 末尾调用（语言切换后刷新）；
+//   3) eventFilter 的布局变化异步回调里调用（覆盖 Qt 后置创建的溢出按钮）。
+void MainWindow::syncToolbarButtonToolTips() {
+    if (!m_toolbar) return;
+    for (auto* btn : m_toolbar->findChildren<QToolButton*>()) {
+        QAction* act = btn->defaultAction();
+        if (!act) continue;
+        const QString tip = act->toolTip();
+        if (!tip.isEmpty() && btn->toolTip() != tip) {
+            btn->setToolTip(tip);
+        }
+    }
 }
 
 bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
@@ -356,6 +676,15 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
         // 异步修正：等 Qt 自己布局完毕再去找/改扩展按钮
         QTimer::singleShot(0, this, [this]() {
             if (!m_toolbar) return;
+            // 防御：每次布局变化后都重新对所有 QToolButton（包括 Qt 自己后加的
+            // 溢出扩展按钮）启用 autoRaise，确保它们都不绘制 native frame，
+            // 按钮之间不再出现 1px 分隔线。
+            for (auto* btn : m_toolbar->findChildren<QToolButton*>()) {
+                btn->setAutoRaise(true);
+            }
+            // 布局变化后也同步一次 tooltip，覆盖 Qt 后置创建的溢出按钮、
+            // 以及任何被替换/重建的 QToolButton。
+            syncToolbarButtonToolTips();
             auto* ext = m_toolbar->findChild<QToolButton*>("qt_toolbar_ext_button");
             if (!ext) return;
             ext->setToolButtonStyle(Qt::ToolButtonTextOnly);
@@ -379,6 +708,28 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
     return QMainWindow::eventFilter(watched, event);
 }
 
+// 主题切换时调用：按当前 palette 重建所有工具栏图标，
+// 让图标颜色与新主题下的 UI 文字/按钮颜色一致。
+void MainWindow::refreshToolbarIcons() {
+    if (m_backAction)             m_backAction->setIcon(makeArrowIcon(0, m_isDarkTheme));
+    if (m_forwardAction)          m_forwardAction->setIcon(makeArrowIcon(1, m_isDarkTheme));
+    if (m_upAction)               m_upAction->setIcon(makeArrowIcon(2, m_isDarkTheme));
+    if (m_refreshAction)          m_refreshAction->setIcon(makeRefreshIcon(m_isDarkTheme));
+    if (m_copyAction)             m_copyAction->setIcon(makeCopyIcon(m_isDarkTheme));
+    if (m_cutAction)              m_cutAction->setIcon(makeCutIcon(m_isDarkTheme));
+    if (m_pasteAction)            m_pasteAction->setIcon(makePasteIcon(m_isDarkTheme));
+    if (m_deleteAction)           m_deleteAction->setIcon(makeDeleteIcon(m_isDarkTheme));
+    if (m_selectAllAction)        m_selectAllAction->setIcon(makeSelectAllIcon(m_isDarkTheme));
+    if (m_copyPathAction)         m_copyPathAction->setIcon(makeFolderIcon(m_isDarkTheme));
+    if (m_runScriptAction)        m_runScriptAction->setIcon(makeScriptIcon(m_isDarkTheme));
+    if (m_searchAction)           m_searchAction->setIcon(makeSearchIcon(m_isDarkTheme));
+    if (m_remoteConnectAction)    m_remoteConnectAction->setIcon(makeConnectIcon(m_isDarkTheme));
+    if (m_remoteDisconnectAction) m_remoteDisconnectAction->setIcon(makeDisconnectIcon(m_isDarkTheme));
+    if (m_hiddenAction)           m_hiddenAction->setIcon(makeEyeIcon(m_isDarkTheme));
+    if (m_themeAction)            m_themeAction->setIcon(makeThemeIcon(m_isDarkTheme));
+    if (m_settingsAction)         m_settingsAction->setIcon(makeSettingsIcon(m_isDarkTheme));
+}
+
 // 打开设置对话框（语言切换等）。OK 后 I18n 会 emit changed()，
 // 进而触发 retranslateUi() 即时更新 UI。
 void MainWindow::onOpenSettings() {
@@ -391,29 +742,33 @@ void MainWindow::onOpenSettings() {
 // 右键菜单在弹出时每次重新构造，已用 T() 包裹，无需 retranslate。
 // 各子对话框（Search/Remote/Script/About/Settings）自己负责 retranslate。
 void MainWindow::retranslateUi() {
-    if (m_backAction)           m_backAction->setText(T("\xE2\x86\x90 Back"));
-    if (m_forwardAction)        m_forwardAction->setText(T("\xE2\x86\x92 Fwd"));
-    if (m_upAction)             m_upAction->setText(T("\xE2\x86\x91 Up"));
-    if (m_refreshAction)        m_refreshAction->setText(T("\xE2\x9F\xB3 Refresh"));
-    if (m_copyAction)           m_copyAction->setText(T("Copy"));
-    if (m_cutAction)            m_cutAction->setText(T("Cut"));
-    if (m_pasteAction)          m_pasteAction->setText(T("Paste"));
-    if (m_deleteAction)         m_deleteAction->setText(T("Delete"));
-    if (m_selectAllAction)      m_selectAllAction->setText(T("Select All"));
-    if (m_copyPathAction)       m_copyPathAction->setText(T("Copy Path"));
-    if (m_runScriptAction)      m_runScriptAction->setText(T("Script"));
-    if (m_searchAction)         m_searchAction->setText(T("Search"));
-    if (m_remoteConnectAction)  m_remoteConnectAction->setText(T("Connect"));
-    if (m_remoteDisconnectAction) m_remoteDisconnectAction->setText(T("Disconnect"));
-    if (m_hiddenAction)         m_hiddenAction->setText(T("\xE2\x97\x89 Hidden"));
+    // 工具栏按钮已改为图标显示，这里只更新 ToolTip 文本
+    if (m_backAction)           m_backAction->setToolTip(T("Back"));
+    if (m_forwardAction)        m_forwardAction->setToolTip(T("Forward"));
+    if (m_upAction)             m_upAction->setToolTip(T("Up"));
+    if (m_refreshAction)        m_refreshAction->setToolTip(T("Refresh"));
+    if (m_copyAction)           m_copyAction->setToolTip(T("Copy"));
+    if (m_cutAction)            m_cutAction->setToolTip(T("Cut"));
+    if (m_pasteAction)          m_pasteAction->setToolTip(T("Paste"));
+    if (m_deleteAction)         m_deleteAction->setToolTip(T("Delete"));
+    if (m_selectAllAction)      m_selectAllAction->setToolTip(T("Select All"));
+    if (m_copyPathAction)       m_copyPathAction->setToolTip(T("Copy Path"));
+    if (m_runScriptAction)      m_runScriptAction->setToolTip(T("Script"));
+    if (m_searchAction)         m_searchAction->setToolTip(T("Search"));
+    if (m_remoteConnectAction)  m_remoteConnectAction->setToolTip(T("Connect"));
+    if (m_remoteDisconnectAction) m_remoteDisconnectAction->setToolTip(T("Disconnect"));
+    if (m_hiddenAction)         m_hiddenAction->setToolTip(T("Show/Hide Hidden Files"));
     if (m_themeAction) {
-        m_themeAction->setText(m_isDarkTheme ? T("Theme: Dark") : T("Theme: Light"));
+        m_themeAction->setToolTip(m_isDarkTheme ? T("Theme: Dark") : T("Theme: Light"));
     }
-    if (m_settingsAction)       m_settingsAction->setText(T("Settings"));
+    if (m_settingsAction)       m_settingsAction->setToolTip(T("Settings"));
 
     // 字号同步与状态栏刷新
     applyFonts();
     updateStatusBar();
+    // 语言切换后，重新把 action 的新 toolTip 同步到 QToolButton，
+    // 否则首次打开时虽然 action->toolTip 被更新，但按钮层仍是旧值（或空）。
+    syncToolbarButtonToolTips();
 }
 
 // 把 AppFonts 当前字号应用到工具栏 / 菜单栏 / 面板（FileListView）/ 目录树。
@@ -1301,11 +1656,13 @@ void MainWindow::onToggleTheme() {
     m_isDarkTheme = !m_isDarkTheme;
     if (m_isDarkTheme) {
         applyDarkTheme();
-        m_themeAction->setText(T("Theme: Dark"));
+        m_themeAction->setToolTip(T("Theme: Dark"));
     } else {
         applyLightTheme();
-        m_themeAction->setText(T("Theme: Light"));
+        m_themeAction->setToolTip(T("Theme: Light"));
     }
+    // 主题切换后 palette 已变，重建图标让描边色跟随新主题
+    refreshToolbarIcons();
 }
 
 // 隐藏文件开关：通过 router 一次性广播到本地+所有 SFTP 后端，再刷新两面板
@@ -1318,10 +1675,11 @@ void MainWindow::onToggleHidden() {
     m_leftPanel->refresh();
     m_rightPanel->refresh();
 
-    // Rebuild the directory tree so hidden directories appear/disappear
-    m_dirTree->buildTree();
-    m_dirTree->highlightPath(m_leftPanel->currentPath(), PanelSide::Left);
-    m_dirTree->highlightPath(m_rightPanel->currentPath(), PanelSide::Right);
+    // 增量同步左侧目录树：在保留展开/滚动/选中状态的前提下，让所有
+    // *已加载* 节点的 children 跟随当前 showHidden 状态出现/消失。
+    // 未加载节点不动，下次展开时 lazyPopulate 自然按当前 filter 拉取。
+    // 不再使用 buildTree() —— 那会 clear() 整棵树并丢失所有用户上下文。
+    m_dirTree->refreshHiddenVisibility();
 
     statusBar()->showMessage(show ? "Showing hidden files" : "Hiding hidden files", 2000);
 }
@@ -1897,35 +2255,93 @@ void MainWindow::applyDarkTheme() {
             background-color: #88C0D0;
         }
         QToolBar {
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3B4252, stop:1 #2E3440);
-            border-bottom: 2px solid #5E81AC;
-            spacing: 4px;
+            background: #2E3440;
+            border: 0px;
+            border-bottom: 1px solid #262B35;
+            spacing: 0px;
             padding: 4px;
         }
-        QToolBar QToolButton {
+        /* separator / handle 与工具栏同色（Nord Polar Night 0 #2E3440），
+           避免默认深色条在纯色底上突兀 */
+        /* 按钮之间的 separator：彻底干掉 —— 零宽零高零边距零边框，
+           background 用 transparent 防止某些 Qt 版本仍渲染 1px 颜色条 */
+        QToolBar::separator {
             background: transparent;
-            border: 1px solid transparent;
-            border-radius: 4px;
-            padding: 4px 10px;
+            width: 0px;
+            height: 0px;
+            margin: 0px;
+            padding: 0px;
+            border: 0px;
+        }
+        QToolBar::handle {
+            background: #2E3440;
+            border: 0px;
+            width: 0px;
+            margin: 0px;
+            padding: 0px;
+        }
+        /* 按钮底色：与目录树背景 #2E3440 完全同色，按钮和工具栏融为一体；
+           所有状态显式 border: 0px / outline: 0px（含四向独立声明，防止 cascade 复活），
+           按钮矩形整块由实色填满，图标贴在按钮底色上，杜绝任何边框/抗锯齿混色
+           露出底层 toolbar 色，更杜绝按钮之间出现 1px 分隔线。 */
+        QToolBar QToolButton {
+            background: #2E3440;
+            border: 0px solid transparent;
+            border-left: 0px;
+            border-right: 0px;
+            border-top: 0px;
+            border-bottom: 0px;
+            border-radius: 0px;
+            outline: 0px;
+            margin: 0px;
+            padding: 6px 12px;
             color: #E5E9F0;
         }
+        QToolBar QToolButton:focus {
+            outline: 0px;
+            border: 0px;
+            border-left: 0px;
+            border-right: 0px;
+            border-top: 0px;
+            border-bottom: 0px;
+            background: #2E3440;
+        }
         QToolBar QToolButton:hover {
-            background: rgba(136, 192, 208, 0.15);
-            border-color: #88C0D0;
+            background: #3B5168;
+            border: 0px;
+            border-left: 0px;
+            border-right: 0px;
+            border-top: 0px;
+            border-bottom: 0px;
+            outline: 0px;
             color: #88C0D0;
         }
         QToolBar QToolButton:pressed {
-            background: rgba(136, 192, 208, 0.30);
+            background: #46627E;
+            border: 0px;
+            border-left: 0px;
+            border-right: 0px;
+            border-top: 0px;
+            border-bottom: 0px;
+            outline: 0px;
         }
         QToolBar QToolButton:checked {
-            background: rgba(143, 188, 187, 0.25);
-            border-color: #8FBCBB;
+            background: #3D5959;
+            border: 0px;
+            border-left: 0px;
+            border-right: 0px;
+            border-top: 0px;
+            border-bottom: 0px;
+            outline: 0px;
             color: #8FBCBB;
         }
         /* 工具栏溢出按钮（"放不下的按钮"展开入口）：
            显式给一个清晰的 ">>" 标识，让用户在窄窗口/大字号下也能找到。 */
         QToolBar QToolButton#qt_toolbar_ext_button {
             qproperty-text: ">>";
+            background: #2E3440;
+            border: 0px;
+            outline: 0px;
             min-width: 40px;
             min-height: 26px;
             padding: 2px 8px;
@@ -1933,7 +2349,9 @@ void MainWindow::applyDarkTheme() {
             color: #88C0D0;
         }
         QToolBar QToolButton#qt_toolbar_ext_button:hover {
-            background: rgba(136, 192, 208, 0.20);
+            background: #3B5168;
+            border: 0px;
+            outline: 0px;
             color: #ECEFF4;
         }
         QTabWidget::pane {

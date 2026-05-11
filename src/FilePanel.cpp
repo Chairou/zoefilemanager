@@ -188,21 +188,21 @@ void FilePanel::createTab(const QString& path) {
     tab.fileList->installEventFilter(this);
     tab.fileList->viewport()->installEventFilter(this);
 
-    // Load entries
+    // ★ 单一数据源：先把视图 rootPath 切过去（setEntries 里保存 m_currentPath），
+    // 然后用视图自己持有的 currentPath 作为 canonical 值回填 tab+pathBar。
     auto entries = FileSystemRouter::instance().listDirectory(path);
     tab.fileList->setEntries(entries, path);
-    tab.pathBar->setPath(path);
-
-    // Get directory name for tab title
-    QString title = path;
-    if (path != "/") {
-        title = path.mid(path.lastIndexOf('/') + 1);
-    }
 
     int index = m_stack->addWidget(tab.container);
-    m_tabBar->insertTab(index, title);
+    // 先 insertTab 得到一个占位标题（用 path 的 basename），再在 m_tabs append 完
+    // 之后走 syncPathUI 统一刷新，避免中间态下 tab 标题和 pathBar 不同步。
+    m_tabBar->insertTab(index, titleFromPath(path));
     m_tabs.append(tab);
     m_tabBar->setCurrentIndex(index);
+
+    // ★ 最后一步 —— 统一入口回填 tab 标题和路径栏文本，以 fileList 的真实
+    //   currentPath 为准（而非参数 `path`，保险起见）。
+    syncPathUI(index, tab.fileList->currentPath());
 }
 
 void FilePanel::navigateTo(const QString& path) {
@@ -215,19 +215,14 @@ void FilePanel::navigateTo(const QString& path) {
     tab.state.currentPath = path;
     tab.state.selectedIndices.clear();
 
-    // Update view
+    // ★ 先切视图 rootPath（SSOT 源头），再统一刷新 tab+pathBar。
     auto entries = FileSystemRouter::instance().listDirectory(path);
     tab.fileList->setEntries(entries, path);
-    tab.pathBar->setPath(path);
 
-    // Update tab title
-    QString title = path;
-    if (path != "/") {
-        title = path.mid(path.lastIndexOf('/') + 1);
-    }
-    m_tabBar->setTabText(m_tabBar->currentIndex(), title);
+    const int idx = m_tabBar->currentIndex();
+    syncPathUI(idx, tab.fileList->currentPath());
 
-    emit pathChanged(path, m_side);
+    emit pathChanged(tab.fileList->currentPath(), m_side);
 }
 
 void FilePanel::goBack() {
@@ -241,13 +236,9 @@ void FilePanel::goBack() {
 
     auto entries = FileSystemRouter::instance().listDirectory(prevPath);
     tab.fileList->setEntries(entries, prevPath);
-    tab.pathBar->setPath(prevPath);
 
-    QString title = prevPath;
-    if (prevPath != "/") title = prevPath.mid(prevPath.lastIndexOf('/') + 1);
-    m_tabBar->setTabText(m_tabBar->currentIndex(), title);
-
-    emit pathChanged(prevPath, m_side);
+    syncPathUI(m_tabBar->currentIndex(), tab.fileList->currentPath());
+    emit pathChanged(tab.fileList->currentPath(), m_side);
 }
 
 void FilePanel::goForward() {
@@ -261,13 +252,9 @@ void FilePanel::goForward() {
 
     auto entries = FileSystemRouter::instance().listDirectory(nextPath);
     tab.fileList->setEntries(entries, nextPath);
-    tab.pathBar->setPath(nextPath);
 
-    QString title = nextPath;
-    if (nextPath != "/") title = nextPath.mid(nextPath.lastIndexOf('/') + 1);
-    m_tabBar->setTabText(m_tabBar->currentIndex(), title);
-
-    emit pathChanged(nextPath, m_side);
+    syncPathUI(m_tabBar->currentIndex(), tab.fileList->currentPath());
+    emit pathChanged(tab.fileList->currentPath(), m_side);
 }
 
 void FilePanel::goUp() {
@@ -298,7 +285,16 @@ void FilePanel::refresh() {
 
 QString FilePanel::currentPath() const {
     if (m_tabs.isEmpty()) return "/";
-    return currentTab().state.currentPath;
+    // ★ 单一数据源：以文件视图的真实 rootPath 为准。state.currentPath 是
+    // 历史栈维护用的影子副本，理应与 fileList->currentPath() 一致；万一
+    // 由于某个导航路径遗漏了同步，这里依然返回权威值，保证外部拿到的
+    // 是"窗口真正所在的目录"。
+    const TabData& tab = currentTab();
+    if (tab.fileList) {
+        const QString p = tab.fileList->currentPath();
+        if (!p.isEmpty()) return p;
+    }
+    return tab.state.currentPath;
 }
 
 FileListView* FilePanel::currentFileList() const {
@@ -338,7 +334,14 @@ void FilePanel::onTabChanged(int index) {
     if (m_tabs.isEmpty() || index < 0 || index >= m_tabs.size()) return;
     // Sync the stacked widget to the current tab
     m_stack->setCurrentIndex(index);
-    emit pathChanged(currentPath(), m_side);
+    // ★ 切 tab 时也必须走 SSOT 同步：虽然每个 tab 各自持一份 PathBar（随 stack
+    //   自动切换），但如果在上一 tab 内发生过状态漂移，这里再兜底对齐一次，
+    //   保证"当前可见 tab 的 pathBar 和 tab 标题 = 该 tab 的 fileList rootPath"。
+    auto& tab = m_tabs[index];
+    const QString canonical = tab.fileList ? tab.fileList->currentPath()
+                                           : tab.state.currentPath;
+    syncPathUI(index, canonical);
+    emit pathChanged(canonical, m_side);
     emit activated(m_side);
     updateTabColor();
 }
@@ -382,6 +385,53 @@ FilePanel::TabData& FilePanel::currentTab() {
 
 const FilePanel::TabData& FilePanel::currentTab() const {
     return m_tabs[m_tabBar->currentIndex()];
+}
+
+// ---------------------------------------------------------------------------
+// 单一数据源同步入口：把指定 tab 的标题 + 路径栏文本对齐到 canonicalPath。
+// 规则：
+//   - canonicalPath 必须来自"文件视图的真实 rootPath"（即 FileListView::
+//     currentPath()），这是本应用关于当前所在目录的唯一权威值。
+//   - tab 标题只显示当前目录的 basename（比如 "chairou"），不渲染祖先链。
+//   - 路径栏显示完整当前路径文本（由 PathBar 内部按只读样式绘制）。
+//   - 也把 state.currentPath 对齐到 canonicalPath，防止历史栈记录与视图漂移。
+// 所有导航入口（createTab / navigateTo / goBack / goForward / onTabChanged）
+// 都必须在视图 rootPath 切换完成后调用本函数收尾，不得自行 setTabText 或
+// pathBar->setPath。
+// ---------------------------------------------------------------------------
+void FilePanel::syncPathUI(int tabIndex, const QString& canonicalPath) {
+    if (tabIndex < 0 || tabIndex >= m_tabs.size()) return;
+    auto& tab = m_tabs[tabIndex];
+
+    // 对齐影子副本到权威值
+    tab.state.currentPath = canonicalPath;
+
+    // 路径栏：只读显示完整当前路径
+    if (tab.pathBar) tab.pathBar->setPath(canonicalPath);
+
+    // tab 标题：basename
+    if (m_tabBar && tabIndex < m_tabBar->count()) {
+        m_tabBar->setTabText(tabIndex, titleFromPath(canonicalPath));
+    }
+}
+
+// 根目录 → "/"；其它路径取末段 basename。
+// - 去掉尾随斜杠（"/Users/chairou/" → "chairou"）
+// - 远程挂载根（"sftp://user@host:22/"）保留为 "/"（再细分没意义）
+QString FilePanel::titleFromPath(const QString& path) {
+    if (path.isEmpty() || path == "/") return QStringLiteral("/");
+
+    // 远程挂载根："sftp://user@host:22/" 去掉尾 '/' 后仍以 ':' 结尾（端口段），
+    // 说明整条就是一个挂载根，不再细分 basename。
+    QString p = path;
+    while (p.size() > 1 && p.endsWith('/')) p.chop(1);
+    if (p.isEmpty()) return QStringLiteral("/");
+
+    const int slash = p.lastIndexOf('/');
+    if (slash < 0) return p;                           // 没斜杠，整串当标题
+    const QString tail = p.mid(slash + 1);
+    if (tail.isEmpty()) return QStringLiteral("/");    // 极端兜底
+    return tail;
 }
 
 void FilePanel::updateTabColor() {

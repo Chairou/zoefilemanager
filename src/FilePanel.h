@@ -107,6 +107,16 @@ private:
     TabData& currentTab();
     const TabData& currentTab() const;
 
+    // ----- 单一数据源：路径 UI 同步入口 -----
+    // 在视图 rootPath 切换完成后调用，把 tab 标题、路径栏文本统一对齐到
+    // `canonicalPath`（即文件视图的真实 rootPath）。任何导航路径（navigateTo /
+    // goBack / goForward / createTab / onTabChanged）都必须通过它收尾，
+    // 避免三处 UI 出现分叉。
+    void syncPathUI(int tabIndex, const QString& canonicalPath);
+    // 从绝对路径派生 tab 标题：当前目录的 basename；根目录则显示 "/"。
+    // 对尾随斜杠、远程挂载根做了归一化。
+    static QString titleFromPath(const QString& path);
+
     PanelSide m_side;
     // 自定义"tab 标题栏 + 内容栈"，详见类头注释
     QTabBar* m_tabBar = nullptr;

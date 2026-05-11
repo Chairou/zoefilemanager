@@ -33,6 +33,9 @@ public:
     /// 重设条目并重建表格。`currentPath` 用于合成 . / .. 行
     void setEntries(const QVector<FileEntry>& entries, const QString& currentPath);
 
+    /// 文件视图当前真实的 rootPath（最后一次 setEntries 传入的 currentPath）。
+    /// 作为 tab 标题、路径栏文本等 UI 的**单一数据源（SSOT）**。
+    QString currentPath() const { return m_currentPath; }
     /// 返回当前选中的条目（不含 . / ..）
     QVector<FileEntry> getSelectedEntries() const;
     QVector<int> getSelectedIndices() const;

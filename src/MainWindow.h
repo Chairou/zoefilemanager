@@ -111,6 +111,12 @@ private:
     void setupToolbar();
     void setupStatusBar();
     void setupShortcuts();    // 全局快捷键（Cmd+C/X/V/A/Backspace/...）
+    void refreshToolbarIcons(); // 主题切换时按当前 palette 重建工具栏图标
+    // 把每个 QAction 的 toolTip() 显式同步到其对应 QToolButton 的 toolTip 上。
+    // 这是为了解决 Qt 在"action text 为空 + 样式化 toolbar"的组合下不会自动
+    // 把 action tooltip 复制给内部 QToolButton、导致鼠标悬停不显示提示的问题。
+    // 需要在 toolbar 装配完毕、以及 retranslateUi / 布局变化后都调用一次。
+    void syncToolbarButtonToolTips();
     void applyDarkTheme();
     void applyLightTheme();
     void updateStatusBar();   // 重算左右面板条目数 / 剪贴板提示

@@ -16,10 +16,11 @@ namespace {
 const QHash<QString, QString>& zhDict() {
     static const QHash<QString, QString> kZh = {
         // ---- 工具栏 ----
-        {"\xE2\x86\x90 Back",     "\xE2\x86\x90 \xE5\x90\x8E\xE9\x80\x80"},
-        {"\xE2\x86\x92 Fwd",      "\xE2\x86\x92 \xE5\x89\x8D\xE8\xBF\x9B"},
-        {"\xE2\x86\x91 Up",       "\xE2\x86\x91 \xE4\xB8\x8A\xE4\xB8\x80\xE7\xBA\xA7"},
-        {"\xE2\x9F\xB3 Refresh",  "\xE2\x9F\xB3 \xE5\x88\xB7\xE6\x96\xB0"},
+        //{"\xE2\x86\x90 Back",     "\xE2\x86\x90 \xE5\x90\x8E\xE9\x80\x80"},
+        {"Back",     "后退"},
+        {"Fwd",      "前进"},
+        {"Up",       "向上"},
+        {"Refresh",  "刷新"},
         {"Copy",                   "复制"},
         {"Cut",                    "剪切"},
         {"Paste",                  "粘贴"},
@@ -31,7 +32,7 @@ const QHash<QString, QString>& zhDict() {
         {"Search",                 "搜索"},
         {"Connect",                "连接"},
         {"Disconnect",             "断开连接"},
-        {"\xE2\x97\x89 Hidden",    "\xE2\x97\x89 \xE9\x9A\x90\xE8\x97\x8F"},
+        {"Hidden",    "隐藏/显示"},
         {"Theme: Dark",            "主题：深色"},
         {"Theme: Light",           "主题：浅色"},
 

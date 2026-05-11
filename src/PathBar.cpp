@@ -1,14 +1,18 @@
 // =============================================================================
 // PathBar.cpp —— 见 PathBar.h
 //
-// 重点函数 rebuildButtons：决定面包屑如何拆分。对 SFTP URL 必须先把整个
-// "sftp://user@host:22" 当作一个不可拆的"根"，否则按 '/' 一拆就乱。
+// 2026-05 第二轮重构：在保持 SSOT 铁律的前提下，恢复**可点击面包屑**：
+//   - 本地路径 "/a/b/c" 拆分为 [根"/", "a", "b", "c"] 四段按钮 + 三个 "/" 分隔符
+//   - 点击段按钮 → emit pathSelected(absPrefix) → FilePanel::navigateTo 跳转
+//   - 远程 URL (sftp://user@host:22/...) 保持整条只读展示（避免误拆 "://"）
+//   - 整条路径复制：双击空白区域进入编辑模式；或点 ✎；或 Ctrl+L
 // =============================================================================
 
 #include "PathBar.h"
 #include "FileSystemRouter.h"
 #include "I18n.h"
 #include <QLabel>
+#include <QToolButton>
 #include <QApplication>
 #include <QClipboard>
 #include <QTimer>
@@ -20,27 +24,101 @@
 #include <QKeyEvent>
 #include <QFileInfo>
 #include <QDir>
+#include <QStringList>
 
 PathBar::PathBar(QWidget* parent)
     : QWidget(parent)
 {
     // Overall bar height: just tall enough for one line of text.
-    // 22px gives comfortable breathing room for most font sizes without
-    // feeling chunky. QLineEdit/QPushButton honor this via their own minHeight.
     setFixedHeight(22);
 
     m_stack = new QStackedLayout(this);
     m_stack->setContentsMargins(0, 0, 0, 0);
     m_stack->setSpacing(0);
 
-    // --- Breadcrumb page ----------------------------------------------
-    m_breadcrumbPage = new QWidget();
-    m_layout = new QHBoxLayout(m_breadcrumbPage);
+    // --- Display page --------------------------------------------------
+    m_displayPage = new QWidget();
+    m_layout = new QHBoxLayout(m_displayPage);
     m_layout->setContentsMargins(4, 0, 4, 0);
-    m_layout->setSpacing(1);
+    m_layout->setSpacing(2);
     m_layout->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-    // Double-click on empty area of the breadcrumb row enters edit mode
-    m_breadcrumbPage->installEventFilter(this);
+    // Double-click on empty area of the display row enters edit mode
+    m_displayPage->installEventFilter(this);
+
+    // 面包屑容器（本地路径用）
+    m_crumbHost = new QWidget();
+    m_crumbLayout = new QHBoxLayout(m_crumbHost);
+    m_crumbLayout->setContentsMargins(0, 0, 0, 0);
+    m_crumbLayout->setSpacing(0);
+    m_crumbLayout->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    m_crumbHost->installEventFilter(this);
+
+    // 远程 URL fallback label（点击复制）
+    m_pathLabel = new QPushButton("");
+    m_pathLabel->setFlat(true);
+    m_pathLabel->setCursor(Qt::PointingHandCursor);
+    m_pathLabel->setFocusPolicy(Qt::NoFocus);
+    m_pathLabel->setMaximumHeight(20);
+    m_pathLabel->setMinimumHeight(20);
+    m_pathLabel->setToolTip(T("Click to copy current path"));
+    m_pathLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    m_pathLabel->setStyleSheet(
+        "QPushButton {"
+        "  padding: 0 6px;"
+        "  margin: 0;"
+        "  min-height: 20px;"
+        "  max-height: 20px;"
+        "  border: 1px solid transparent;"
+        "  border-radius: 3px;"
+        "  background: transparent;"
+        "  color: #D8DEE9;"
+        "  text-align: left;"
+        "}"
+        "QPushButton:hover {"
+        "  background: rgba(255,255,255,0.08);"
+        "  border-color: rgba(136,192,208,0.35);"
+        "}"
+        "QPushButton:pressed { background: rgba(255,255,255,0.14); }"
+        "QPushButton:focus { outline: none; }");
+    connect(m_pathLabel, &QPushButton::clicked, this, [this]() {
+        if (m_path.isEmpty()) return;
+        QApplication::clipboard()->setText(m_path);
+        QPoint pos = m_pathLabel->mapToGlobal(
+            QPoint(m_pathLabel->width() / 2, m_pathLabel->height()));
+        showCopiedToast(pos);
+    });
+
+    m_editBtn = new QPushButton(QString::fromUtf8("\xE2\x9C\x8E"));  // ✎
+    m_editBtn->setToolTip(T("Edit path (double-click empty area, or Ctrl+L)"));
+    m_editBtn->setFlat(true);
+    m_editBtn->setCursor(Qt::PointingHandCursor);
+    m_editBtn->setFocusPolicy(Qt::NoFocus);
+    m_editBtn->setFixedSize(18, 18);
+    m_editBtn->setStyleSheet(
+        "QPushButton {"
+        "  padding: 0;"
+        "  margin: 0;"
+        "  border: 1px solid transparent;"
+        "  border-radius: 3px;"
+        "  background: transparent;"
+        "  color: #81A1C1;"
+        "  font-size: 11px;"
+        "}"
+        "QPushButton:hover {"
+        "  background: rgba(136, 192, 208, 0.18);"
+        "  color: #88C0D0;"
+        "  border-color: #88C0D0;"
+        "}"
+        "QPushButton:pressed {"
+        "  background: #5E81AC;"
+        "  color: #ECEFF4;"
+        "}");
+    connect(m_editBtn, &QPushButton::clicked, this, &PathBar::enterEditMode);
+
+    // 面包屑容器占据 1 份伸展空间；远程 URL 路径 label 也占 1 份（同时只显示其一）
+    m_layout->addWidget(m_crumbHost, 1);
+    m_layout->addWidget(m_pathLabel, 1);
+    m_layout->addWidget(m_editBtn, 0, Qt::AlignVCenter);
 
     // --- Edit page ----------------------------------------------------
     m_editPage = new QWidget();
@@ -58,18 +136,18 @@ PathBar::PathBar(QWidget* parent)
 
     connect(m_pathEdit, &QLineEdit::returnPressed, this, &PathBar::commitEditedPath);
 
-    m_stack->addWidget(m_breadcrumbPage);
+    m_stack->addWidget(m_displayPage);
     m_stack->addWidget(m_editPage);
-    m_stack->setCurrentWidget(m_breadcrumbPage);
+    m_stack->setCurrentWidget(m_displayPage);
 
     setPath("/");
 }
 
 void PathBar::setPath(const QString& path) {
     m_path = path;
-    rebuildButtons();
-    // If we were in edit mode, stay in edit mode but refresh the text;
-    // otherwise the breadcrumb gets rebuilt automatically above.
+    rebuildDisplay();
+    // If we were in edit mode, keep edit mode but refresh the text;
+    // otherwise the display label gets refreshed above.
     if (m_pathEdit) m_pathEdit->setText(path);
 }
 
@@ -81,7 +159,7 @@ void PathBar::enterEditMode() {
 }
 
 void PathBar::exitEditMode() {
-    m_stack->setCurrentWidget(m_breadcrumbPage);
+    m_stack->setCurrentWidget(m_displayPage);
 }
 
 void PathBar::commitEditedPath() {
@@ -121,8 +199,9 @@ void PathBar::commitEditedPath() {
 }
 
 bool PathBar::eventFilter(QObject* obj, QEvent* event) {
-    // Double-click on empty breadcrumb area → enter edit mode
-    if (obj == m_breadcrumbPage && event->type() == QEvent::MouseButtonDblClick) {
+    // Double-click on empty display area → enter edit mode
+    if ((obj == m_displayPage || obj == m_crumbHost)
+        && event->type() == QEvent::MouseButtonDblClick) {
         enterEditMode();
         return true;
     }
@@ -144,156 +223,100 @@ bool PathBar::eventFilter(QObject* obj, QEvent* event) {
     return QWidget::eventFilter(obj, event);
 }
 
-void PathBar::rebuildButtons() {
-    // Clear existing buttons
-    for (auto* btn : m_buttons) {
-        m_layout->removeWidget(btn);
-        delete btn;
-    }
-    m_buttons.clear();
-    m_editBtn = nullptr;
-
-    // Remove any leftover non-widget items (spacers/stretches)
-    while (QLayoutItem* item = m_layout->takeAt(0)) {
-        if (!item->widget()) {
-            delete item;
-        } else {
-            m_layout->addItem(item);
-            break;
+void PathBar::clearCrumbs() {
+    if (!m_crumbLayout) return;
+    // 删除 m_crumbHost 内所有子 widget（按钮 + 分隔符 label）
+    while (QLayoutItem* item = m_crumbLayout->takeAt(0)) {
+        if (QWidget* w = item->widget()) {
+            w->deleteLater();
         }
+        delete item;
+    }
+}
+
+void PathBar::rebuildDisplay() {
+    // 单一数据源：把 m_path 映射为面包屑（本地）或整条 label（远程 URL）。
+    // 绝不在此方法内修改 m_path。所有跳转通过 emit pathSelected。
+    if (!m_crumbHost || !m_pathLabel) return;
+
+    clearCrumbs();
+
+    // 远程 URL 特判：sftp://... 原样整条只读显示，不做拆分。
+    const bool isRemote = m_path.contains("://");
+    if (isRemote) {
+        m_crumbHost->hide();
+        m_pathLabel->show();
+        m_pathLabel->setText(m_path);
+        return;
+    }
+    m_pathLabel->hide();
+    m_crumbHost->show();
+
+    // 本地路径：解析为 ["/", "a", "b", "c"]
+    // 例：m_path = "/Users/chairou/code" → segs = ["Users","chairou","code"]
+    QStringList segs = m_path.split('/', Qt::SkipEmptyParts);
+
+    // 工具函数：创建一个面包屑按钮
+    auto makeCrumb = [this](const QString& text, const QString& absPath) -> QToolButton* {
+        auto* btn = new QToolButton(m_crumbHost);
+        btn->setObjectName("crumbBtn");
+        btn->setText(text);
+        btn->setAutoRaise(true);
+        btn->setCursor(Qt::PointingHandCursor);
+        btn->setFocusPolicy(Qt::NoFocus);
+        btn->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        btn->setProperty("absPath", absPath);
+        btn->setStyleSheet(
+            "QToolButton#crumbBtn {"
+            "  background: transparent;"
+            "  border: 0px;"
+            "  padding: 0 6px;"
+            "  min-height: 20px;"
+            "  max-height: 20px;"
+            "  color: #ECEFF4;"
+            "}"
+            "QToolButton#crumbBtn:hover {"
+            "  color: #88C0D0;"
+            "  text-decoration: underline;"
+            "}"
+            "QToolButton#crumbBtn:pressed {"
+            "  color: #5E81AC;"
+            "}");
+        connect(btn, &QToolButton::clicked, this, [this, absPath]() {
+            // SSOT：不自改 m_path，请求 FilePanel::navigateTo
+            emit pathSelected(absPath);
+        });
+        return btn;
+    };
+
+    // 工具函数：创建一个 "/" 分隔符
+    auto makeSep = [this]() -> QLabel* {
+        auto* sep = new QLabel("/", m_crumbHost);
+        sep->setObjectName("crumbSep");
+        sep->setStyleSheet(
+            "QLabel#crumbSep {"
+            "  color: #4C566A;"
+            "  padding: 0 2px;"
+            "  background: transparent;"
+            "}");
+        return sep;
+    };
+
+    // 根 "/" 按钮（始终在最左，点击回到根）
+    m_crumbLayout->addWidget(makeCrumb("/", "/"));
+
+    // 若 m_path 非根，继续追加每一段
+    QString accum;
+    for (int i = 0; i < segs.size(); ++i) {
+        accum += "/" + segs[i];
+        // 段与段之间（包括根与第一段之间）插入分隔符
+        // 但"根按钮文字本身是 /"，所以段前不再加分隔符以免双斜杠视觉重复
+        if (i > 0) m_crumbLayout->addWidget(makeSep());
+        m_crumbLayout->addWidget(makeCrumb(segs[i], accum));
     }
 
-    const QString btnStyle =
-        "QPushButton {"
-        "  padding: 0 6px;"
-        "  margin: 0;"
-        "  min-height: 20px;"
-        "  max-height: 20px;"
-        "  border: 1px solid transparent;"
-        "  border-radius: 3px;"
-        "  background: transparent;"
-        "  text-align: left;"
-        "}"
-        "QPushButton:hover { background: rgba(255,255,255,0.10); }"
-        "QPushButton:pressed { background: rgba(255,255,255,0.18); }"
-        "QPushButton:focus { outline: none; }";
-
-    // ---- Figure out whether this path lives under a mounted prefix
-    // (e.g. "sftp://demo@test.rebex.net:22") and split it accordingly.
-    //
-    //   localRoot   : the path clickable as the "root" breadcrumb
-    //                 ("/" for local, "sftp://user@host:22/" for remote)
-    //   rootLabel   : what to display on that root button
-    //   relPath     : the part of m_path *inside* the root, e.g. "/pub/foo"
-    //
-    // This is the fix for a bug where remote URLs were split on every "/"
-    // and each crumb emitted a non-routable path like "/sftp:/user@host:22/pub".
-    QString mountPrefix = FileSystemRouter::instance().mountFor(m_path);
-    QString localRoot, rootLabel, relPath;
-    if (!mountPrefix.isEmpty()) {
-        localRoot = mountPrefix + "/";
-        rootLabel = mountPrefix + "/";           // shows "sftp://user@host:22/"
-        relPath   = m_path.mid(mountPrefix.size());
-        if (relPath.startsWith('/')) relPath = relPath.mid(1);
-    } else {
-        localRoot = "/";
-        rootLabel = "/";
-        relPath   = (m_path == "/") ? QString() : m_path.mid(1);  // drop leading '/'
-    }
-
-    // Root button
-    auto* rootBtn = new QPushButton(rootLabel);
-    rootBtn->setFlat(true);
-    rootBtn->setCursor(Qt::PointingHandCursor);
-    rootBtn->setMaximumHeight(20);
-    rootBtn->setFocusPolicy(Qt::NoFocus);
-    rootBtn->setStyleSheet(btnStyle);
-    const QString rootTarget = localRoot;
-    connect(rootBtn, &QPushButton::clicked, this, [this, rootBtn, rootTarget]() {
-        QApplication::clipboard()->setText(rootTarget);
-        QPoint pos = rootBtn->mapToGlobal(QPoint(rootBtn->width() / 2, rootBtn->height()));
-        showCopiedToast(pos);
-        emit pathSelected(rootTarget);
-    });
-    m_layout->addWidget(rootBtn);
-    m_buttons.append(rootBtn);
-
-    if (!relPath.isEmpty()) {
-        QStringList parts = relPath.split('/', Qt::SkipEmptyParts);
-        QString accumulated = localRoot;
-        if (accumulated.endsWith('/')) accumulated.chop(1);  // strip trailing '/'
-        for (int i = 0; i < parts.size(); ++i) {
-            accumulated += "/" + parts[i];
-
-            auto* separator = new QPushButton(">");
-            separator->setFlat(true);
-            separator->setEnabled(false);
-            separator->setMaximumHeight(20);
-            separator->setMaximumWidth(14);
-            separator->setFocusPolicy(Qt::NoFocus);
-            separator->setStyleSheet(
-                "QPushButton {"
-                "  padding: 0;"
-                "  margin: 0;"
-                "  min-height: 20px;"
-                "  max-height: 20px;"
-                "  border: none;"
-                "  background: transparent;"
-                "  color: #888;"
-                "}");
-            m_layout->addWidget(separator);
-            m_buttons.append(separator);
-
-            auto* btn = new QPushButton(parts[i]);
-            btn->setFlat(true);
-            btn->setCursor(Qt::PointingHandCursor);
-            btn->setMaximumHeight(20);
-            btn->setFocusPolicy(Qt::NoFocus);
-            btn->setStyleSheet(btnStyle);
-
-            QString targetPath = accumulated;
-            connect(btn, &QPushButton::clicked, this, [this, btn, targetPath]() {
-                QApplication::clipboard()->setText(targetPath);
-                QPoint pos = btn->mapToGlobal(QPoint(btn->width() / 2, btn->height()));
-                showCopiedToast(pos);
-                emit pathSelected(targetPath);
-            });
-            m_layout->addWidget(btn);
-            m_buttons.append(btn);
-        }
-    }
-
-    m_layout->addStretch();
-
-    // Trailing "edit" button — click to switch to text-input mode
-    m_editBtn = new QPushButton(QString::fromUtf8("\xE2\x9C\x8E"));  // ✎
-    m_editBtn->setToolTip(T("Edit path (double-click empty area, or Ctrl+L)"));
-    m_editBtn->setFlat(true);
-    m_editBtn->setCursor(Qt::PointingHandCursor);
-    m_editBtn->setFocusPolicy(Qt::NoFocus);
-    m_editBtn->setFixedSize(18, 18);
-    m_editBtn->setStyleSheet(
-        "QPushButton {"
-        "  padding: 0;"
-        "  margin: 0;"
-        "  border: 1px solid transparent;"
-        "  border-radius: 3px;"
-        "  background: transparent;"
-        "  color: #81A1C1;"
-        "  font-size: 11px;"
-        "}"
-        "QPushButton:hover {"
-        "  background: rgba(136, 192, 208, 0.18);"
-        "  color: #88C0D0;"
-        "  border-color: #88C0D0;"
-        "}"
-        "QPushButton:pressed {"
-        "  background: #5E81AC;"
-        "  color: #ECEFF4;"
-        "}");
-    connect(m_editBtn, &QPushButton::clicked, this, &PathBar::enterEditMode);
-    m_layout->addWidget(m_editBtn);
-    m_buttons.append(m_editBtn);
+    // 右侧留白伸展（让面包屑靠左紧排，剩余空间交给 ✎ 按钮之前的空白）
+    m_crumbLayout->addStretch(1);
 }
 
 void PathBar::showCopiedToast(const QPoint& globalPos) {

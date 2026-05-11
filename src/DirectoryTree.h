@@ -39,6 +39,12 @@ public:
     /// 远程/不在树中的路径静默跳过。不会触发 directorySelected 信号。
     void revealPath(const QString& path);
 
+    /// 切换 Show/Hide 隐藏文件后调用：在不破坏展开/滚动/选中状态的前提下，
+    /// 对所有"已加载"节点的 children 做增量同步（隐藏目录条目按当前
+    /// RealFileSystem::showHidden() 出现或消失）。未加载节点不动 ——
+    /// 用户下次展开时 lazyPopulate 会按当前 filter 自然加载。
+    void refreshHiddenVisibility();
+
 signals:
     void directorySelected(const QString& path);
 
@@ -54,6 +60,10 @@ private:
     QString getPathForItem(QTreeWidgetItem* item) const;
     bool isLoaded(QTreeWidgetItem* item) const;
     void setLoaded(QTreeWidgetItem* item, bool loaded);
+
+    // 增量刷新辅助（仅 refreshHiddenVisibility 使用）
+    bool isAncestorOf_(QTreeWidgetItem* ancestor, QTreeWidgetItem* descendant) const;
+    void removeFromPathMap_(QTreeWidgetItem* node);
 
     // QTreeWidgetItem::data 用的 role
     static const int ROLE_PATH = Qt::UserRole;

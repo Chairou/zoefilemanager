@@ -15,6 +15,8 @@
 #include <QRect>
 #include <QTimer>
 #include <QFontMetrics>
+#include <QTreeWidgetItemIterator>
+#include <QSet>
 
 DirectoryTree::DirectoryTree(QWidget* parent)
     : QTreeWidget(parent)
@@ -306,4 +308,188 @@ void DirectoryTree::revealPath(const QString& path) {
                                   hbar->maximum());
         hbar->setValue(newVal);
     });
+}
+
+// =============================================================================
+// refreshHiddenVisibility ——切换 Show/Hide 隐藏文件后的"增量同步"
+//
+// 目标：
+//   - 展开/滚动/选中状态完全保持
+//   - 已加载节点的 children 跟随当前 showHidden 状态增删
+//   - 未加载节点不动（下次展开时 lazyPopulate 会按当前 filter 拉取）
+//
+// 算法：
+//   1) 阻塞信号 + 暂停重绘，记录 vScroll/hScroll 与 currentItem 的 path
+//   2) 遍历整棵树（仅处理 isLoaded=true 的节点）：
+//        - 取该节点的 path，调 fs.getSubDirectories(path) 拿当前 filter
+//          下应有的 children 路径集合 newSet
+//        - 当前 children 中对应 path 集合 oldSet
+//        - 删除 (oldSet - newSet) 的节点，并清理 m_pathToItem 映射；
+//          被删节点是当前选中或祖先 → 选中转移到最近的可见祖先
+//        - 插入 (newSet - oldSet) 的节点；插入位置按 newSet 的顺序
+//          （fs.getSubDirectories 已排序）保持有序
+//   3) 恢复 currentItem 与滚动位置
+//
+// 注意：getSubDirectories 已返回完整绝对路径列表，且其内部读取
+// m_showHidden，调用方无需额外传 filter。
+// =============================================================================
+void DirectoryTree::refreshHiddenVisibility() {
+    QSignalBlocker blocker(this);
+    setUpdatesEnabled(false);
+
+    // 记录滚动位置 & 当前选中
+    auto* vbar = verticalScrollBar();
+    auto* hbar = horizontalScrollBar();
+    const int savedV = vbar ? vbar->value() : 0;
+    const int savedH = hbar ? hbar->value() : 0;
+
+    QTreeWidgetItem* curItem = currentItem();
+    QString savedCurPath = curItem ? getPathForItem(curItem) : QString();
+
+    auto& fs = RealFileSystem::instance();
+
+    // 把所有已加载节点先收集到一个列表（避免边遍历边改）
+    QList<QTreeWidgetItem*> loadedNodes;
+    {
+        QTreeWidgetItemIterator it(this);
+        while (*it) {
+            QTreeWidgetItem* node = *it;
+            if (isLoaded(node)) {
+                loadedNodes.append(node);
+            }
+            ++it;
+        }
+    }
+
+    for (QTreeWidgetItem* parentItem : loadedNodes) {
+        const QString parentPath = getPathForItem(parentItem);
+        if (parentPath.isEmpty()) continue;
+
+        // 当前 filter 下该节点应有的子目录路径列表（已排序）
+        const QStringList desired = fs.getSubDirectories(parentPath);
+        QSet<QString> desiredSet(desired.begin(), desired.end());
+
+        // 现有 children 的 path 集合（跳过 "Loading..." 占位符）
+        QMap<QString, QTreeWidgetItem*> existing;
+        for (int i = 0; i < parentItem->childCount(); ++i) {
+            QTreeWidgetItem* child = parentItem->child(i);
+            QString cp = getPathForItem(child);
+            if (cp.isEmpty()) continue;  // placeholder
+            existing[cp] = child;
+        }
+
+        // ---- 1) 删除 existing - desired ----
+        for (auto eit = existing.begin(); eit != existing.end(); ++eit) {
+            if (desiredSet.contains(eit.key())) continue;
+
+            QTreeWidgetItem* toRemove = eit.value();
+
+            // 若被删节点本身或其后代是当前选中 → 把选中转到最近可见祖先
+            if (curItem && (curItem == toRemove ||
+                            isAncestorOf_(toRemove, curItem))) {
+                curItem = parentItem;
+                savedCurPath = parentPath;
+            }
+
+            // 清理 m_pathToItem（包括所有后代）
+            removeFromPathMap_(toRemove);
+
+            // 从树中移除并 delete
+            int idx = parentItem->indexOfChild(toRemove);
+            if (idx >= 0) {
+                delete parentItem->takeChild(idx);
+            }
+        }
+
+        // ---- 2) 插入 desired - existing（按 desired 顺序，保证排序一致）----
+        for (int i = 0; i < desired.size(); ++i) {
+            const QString& dirPath = desired[i];
+            if (existing.contains(dirPath)) continue;  // 已有，跳过
+
+            QString name = dirPath.mid(dirPath.lastIndexOf('/') + 1);
+            auto* item = new QTreeWidgetItem();
+            item->setText(0, name);
+            item->setData(0, ROLE_PATH, dirPath);
+            item->setData(0, ROLE_LOADED, false);
+            item->setIcon(0, style()->standardIcon(QStyle::SP_DirIcon));
+            m_pathToItem[dirPath] = item;
+
+            // 添加占位符让展开三角显示
+            QStringList grandchildren = fs.getSubDirectories(dirPath);
+            if (!grandchildren.isEmpty()) {
+                auto* placeholder = new QTreeWidgetItem(item);
+                placeholder->setText(0, "Loading...");
+            }
+
+            // 插入到正确位置（按 desired 顺序）
+            // 需要找到 desired[i] 在 parentItem 当前 children 中应处的位置
+            int insertAt = parentItem->childCount();  // 默认插到末尾
+            for (int j = 0; j < parentItem->childCount(); ++j) {
+                QString cp = getPathForItem(parentItem->child(j));
+                if (cp.isEmpty()) continue;  // placeholder
+                // 找到第一个 desired 序号比当前更大的位置
+                int otherIdx = desired.indexOf(cp);
+                if (otherIdx > i) {
+                    insertAt = j;
+                    break;
+                }
+            }
+            parentItem->insertChild(insertAt, item);
+        }
+    }
+
+    // ---- 3) 恢复高亮（防止增量过程中样式被擦除）----
+    // m_pathToItem 可能因删除而失效；highlightPath 内部会判断存在性。
+    if (!m_leftHighlight.isEmpty()) {
+        QString tmp = m_leftHighlight;
+        m_leftHighlight.clear();   // 强制 highlightPath 重新应用
+        highlightPath(tmp, PanelSide::Left);
+    }
+    if (!m_rightHighlight.isEmpty()) {
+        QString tmp = m_rightHighlight;
+        m_rightHighlight.clear();
+        highlightPath(tmp, PanelSide::Right);
+    }
+
+    // ---- 4) 恢复 currentItem ----
+    if (!savedCurPath.isEmpty()) {
+        auto it = m_pathToItem.find(savedCurPath);
+        if (it != m_pathToItem.end()) {
+            setCurrentItem(it.value());
+        }
+    }
+
+    // ---- 5) 恢复滚动位置 ----
+    if (vbar) vbar->setValue(savedV);
+    if (hbar) hbar->setValue(savedH);
+
+    setUpdatesEnabled(true);
+}
+
+// 辅助：判断 ancestor 是否为 descendant 的（直接或间接）父节点
+bool DirectoryTree::isAncestorOf_(QTreeWidgetItem* ancestor,
+                                  QTreeWidgetItem* descendant) const {
+    if (!ancestor || !descendant) return false;
+    QTreeWidgetItem* p = descendant->parent();
+    while (p) {
+        if (p == ancestor) return true;
+        p = p->parent();
+    }
+    return false;
+}
+
+// 辅助：从 m_pathToItem 中移除 node 自身及其所有后代条目（不 delete 节点，
+// 仅清理映射），用于删除子树前防止悬挂指针。
+void DirectoryTree::removeFromPathMap_(QTreeWidgetItem* node) {
+    if (!node) return;
+    QString path = getPathForItem(node);
+    if (!path.isEmpty()) {
+        auto it = m_pathToItem.find(path);
+        if (it != m_pathToItem.end() && it.value() == node) {
+            m_pathToItem.erase(it);
+        }
+    }
+    for (int i = 0; i < node->childCount(); ++i) {
+        removeFromPathMap_(node->child(i));
+    }
 }
