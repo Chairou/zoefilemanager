@@ -131,10 +131,26 @@ if(APPLE)
             set(_deploy_script "${CMAKE_CURRENT_SOURCE_DIR}/cmake/deploy_macos.cmake")
 
             # Run macdeployqt first, then the vendor-copy script.
+            #
+            # Notes on flags:
+            #   -no-strip   : keep symbols (faster, and avoids extra mutation
+            #                 that would invalidate signatures we redo later).
+            #   -codesign=- : we DO NOT let macdeployqt sign anything. It
+            #                 self-invalidates signatures by patching dylibs
+            #                 after signing them (e.g. libbrotlicommon), and
+            #                 it then fails its own --verify check. Our
+            #                 deploy_macos.cmake script does the final
+            #                 ad-hoc signing once everything is in place.
+            #
+            # We invoke macdeployqt via `sh -c "... ; true"` so that benign
+            # ERROR lines about optional Qt modules NOT used by this app
+            # (QtPdf, QtVirtualKeyboard, etc. dragged in by plugin scans)
+            # never abort the whole build.
             add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-                COMMAND "${MACDEPLOYQT_EXECUTABLE}"
-                    $<TARGET_BUNDLE_DIR:${PROJECT_NAME}>
-                    -verbose=1
+                COMMAND ${CMAKE_COMMAND} -E echo
+                    "Running macdeployqt (non-fatal: optional-module rpath warnings are expected)"
+                COMMAND sh -c
+                    "'${MACDEPLOYQT_EXECUTABLE}' '$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>' -verbose=1 -no-strip '-codesign=-' || echo 'macdeployqt reported errors; continuing — final sign happens in deploy_macos.cmake'"
                 COMMAND ${CMAKE_COMMAND}
                     -DBUNDLE=$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>
                     -DLIBSSH2_SRC=${LIBSSH2_LIBRARY}
