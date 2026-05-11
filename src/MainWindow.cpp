@@ -1244,7 +1244,13 @@ void MainWindow::onToggleHidden() {
 // 面板路径变了：同步左侧目录树高亮 + 状态栏文字
 void MainWindow::onPanelPathChanged(const QString& path, PanelSide side) {
     m_dirTree->highlightPath(path, side);
-    m_dirTree->expandToPath(path);
+    // 仅当变化的是 active 面板时，把树滚动并居中到该项；
+    // 否则只展开父级链（保持高亮可见，但不抢用户视野）。
+    if (side == m_activePane) {
+        m_dirTree->revealPath(path);
+    } else {
+        m_dirTree->expandToPath(path);
+    }
     updateStatusBar();
 }
 
