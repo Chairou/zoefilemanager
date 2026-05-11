@@ -22,11 +22,13 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QClipboard>
+#include <QToolButton>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QProgressDialog>
 #include <QProcess>
+#include <QProxyStyle>
 #include <QDesktopServices>
 #include <QUrl>
 #include <QEventLoop>
@@ -39,6 +41,28 @@
 #include "I18n.h"
 #include "AppFonts.h"
 #include "SettingsDialog.h"
+
+// Proxy style 用来强制把 PM_ToolBarExtensionExtent（工具栏溢出按钮的宽度
+// metric）增大。Qt 在 macOS 原生样式上只给 16~20px，导致我们自定义的 ">>"
+// 文字按钮被 toolbar viewport 右侧裁切。覆盖这个 metric 是让 toolbar 真正
+// 给溢出按钮预留足够空间的唯一规范方法（QSS min-width / setFixedSize 都
+// 不会改变 toolbar 自己分配的可见宽度）。
+class ToolbarExtStyle : public QProxyStyle {
+public:
+    using QProxyStyle::QProxyStyle;
+    int pixelMetric(PixelMetric pm, const QStyleOption* opt = nullptr,
+                    const QWidget* widget = nullptr) const override {
+        if (pm == PM_ToolBarExtensionExtent) {
+            const int menuPt = AppFonts::instance().effectiveMenuFontSize();
+            QFont f = QApplication::font();
+            if (menuPt > 0) f.setPointSize(menuPt);
+            f.setBold(true);
+            const int textW = QFontMetrics(f).horizontalAdvance(QStringLiteral(">>"));
+            return qMax(40, textW + 18);
+        }
+        return QProxyStyle::pixelMetric(pm, opt, widget);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // 构造：组装整个 UI 树。顺序大致是：
@@ -314,6 +338,45 @@ void MainWindow::setupToolbar() {
     // 字号变化时刷新工具栏/菜单/面板/目录树字号
     connect(&AppFonts::instance(), &AppFonts::changed,
             this, &MainWindow::applyFonts);
+
+    // 监听 toolbar 的事件，及时修正"溢出扩展按钮"（Qt 在首次溢出时才创建它）
+    toolbar->installEventFilter(this);
+
+    // 安装 proxy style：唯一可靠地让 toolbar 给溢出按钮分配足够宽度的方法。
+    // 用 toolbar 当前的 baseStyle 派生，这样不会破坏原有的视觉风格。
+    toolbar->setStyle(new ToolbarExtStyle(toolbar->style()));
+}
+
+bool MainWindow::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == m_toolbar &&
+        (event->type() == QEvent::Resize ||
+         event->type() == QEvent::LayoutRequest ||
+         event->type() == QEvent::ChildAdded ||
+         event->type() == QEvent::Show)) {
+        // 异步修正：等 Qt 自己布局完毕再去找/改扩展按钮
+        QTimer::singleShot(0, this, [this]() {
+            if (!m_toolbar) return;
+            auto* ext = m_toolbar->findChild<QToolButton*>("qt_toolbar_ext_button");
+            if (!ext) return;
+            ext->setToolButtonStyle(Qt::ToolButtonTextOnly);
+            if (ext->text() != QStringLiteral(">>")) ext->setText(">>");
+            ext->setToolTip(T("More"));
+            const int menuPt = AppFonts::instance().effectiveMenuFontSize();
+            QFont ef = ext->font();
+            if (menuPt > 0) ef.setPointSize(menuPt); else ef = QFont();
+            ef.setBold(true);
+            ext->setFont(ef);
+            // 强制按钮宽度足够容纳 ">>"：用当前字号的 fontMetrics 计算文字宽度
+            // 加左右内边距 16px，确保不被裁切。Qt 的扩展按钮默认宽度由
+            // QStyle::PM_ToolBarExtensionExtent 决定，stylesheet min-width
+            // 在某些样式下不被尊重，这里直接 setFixed 兜底。
+            const int textW = QFontMetrics(ef).horizontalAdvance(">>");
+            const int w = qMax(40, textW + 18);
+            const int h = qMax(26, QFontMetrics(ef).height() + 10);
+            ext->setFixedSize(w, h);
+        });
+    }
+    return QMainWindow::eventFilter(watched, event);
 }
 
 // 打开设置对话框（语言切换等）。OK 后 I18n 会 emit changed()，
@@ -393,6 +456,28 @@ void MainWindow::applyFonts() {
     applyItemFont(m_rightPanel);
     // 目录树
     applyItemFont(m_dirTree);
+
+    // 工具栏溢出按钮（放不下的 actions 折叠到此处展开）：
+    // QSS 的 qproperty-text 在某些 Qt 版本对它不生效（toolButtonStyle 是 IconOnly），
+    // 这里直接抓到对象强制 TextOnly + ">>"。该按钮在 toolbar 首次溢出时由 Qt 创建，
+    // 所以每次 applyFonts/调整大小都重新尝试一次。
+    if (m_toolbar) {
+        if (auto* ext = m_toolbar->findChild<QToolButton*>("qt_toolbar_ext_button")) {
+            ext->setToolButtonStyle(Qt::ToolButtonTextOnly);
+            ext->setText(">>");
+            ext->setToolTip(T("More"));
+            // 字号跟随菜单字号
+            QFont ef = ext->font();
+            if (menuPt > 0) ef.setPointSize(menuPt); else ef = QFont();
+            ef.setBold(true);
+            ext->setFont(ef);
+            // 强制宽度足够，避免 macOS 原生样式只给极窄一条
+            const int textW = QFontMetrics(ef).horizontalAdvance(">>");
+            const int w = qMax(40, textW + 18);
+            const int h = qMax(26, QFontMetrics(ef).height() + 10);
+            ext->setFixedSize(w, h);
+        }
+    }
 }
 
 // 状态栏：四个 QLabel 平铺，分别显示左面板信息、右面板信息、剪贴板状态、活跃面板提示
@@ -1837,6 +1922,20 @@ void MainWindow::applyDarkTheme() {
             border-color: #8FBCBB;
             color: #8FBCBB;
         }
+        /* 工具栏溢出按钮（"放不下的按钮"展开入口）：
+           显式给一个清晰的 ">>" 标识，让用户在窄窗口/大字号下也能找到。 */
+        QToolBar QToolButton#qt_toolbar_ext_button {
+            qproperty-text: ">>";
+            min-width: 40px;
+            min-height: 26px;
+            padding: 2px 8px;
+            font-weight: bold;
+            color: #88C0D0;
+        }
+        QToolBar QToolButton#qt_toolbar_ext_button:hover {
+            background: rgba(136, 192, 208, 0.20);
+            color: #ECEFF4;
+        }
         QTabWidget::pane {
             border: 1px solid #434C5E;
             background-color: #2E3440;
@@ -2144,6 +2243,18 @@ void MainWindow::applyLightTheme() {
         }
         QToolBar QToolButton:pressed {
             background: rgba(25, 118, 210, 0.2);
+        }
+        /* 工具栏溢出按钮（"放不下的按钮"展开入口） */
+        QToolBar QToolButton#qt_toolbar_ext_button {
+            qproperty-text: ">>";
+            min-width: 40px;
+            min-height: 26px;
+            padding: 2px 8px;
+            font-weight: bold;
+            color: #1976d2;
+        }
+        QToolBar QToolButton#qt_toolbar_ext_button:hover {
+            background: rgba(25, 118, 210, 0.15);
         }
         QTabWidget::pane {
             border: 1px solid #e0e0e0;

@@ -50,6 +50,8 @@ public:
 protected:
     // 拦截关闭事件以持久化窗口/面板状态（左右面板路径、活跃面板、splitter、几何）
     void closeEvent(QCloseEvent* event) override;
+    // 拦截工具栏 resize/show，时机正确地修正"溢出扩展按钮"的文本（>>）
+    bool eventFilter(QObject* watched, QEvent* event) override;
 
 private slots:
     // ----- 工具栏动作 -----

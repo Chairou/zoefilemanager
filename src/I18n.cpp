@@ -49,6 +49,7 @@ const QHash<QString, QString>& zhDict() {
         {"File / Folder name:",    "文件 / 文件夹名："},
         {"0 = use default; recommended 13–18 pt.",
             "0 = 使用默认；建议 13–18 pt。"},
+        {"More",                   "更多"},
 
         // ---- 右键菜单 ----
         {"Open",                    "打开"},
