@@ -146,6 +146,7 @@ private:
     QLabel* m_statusRight;
     QLabel* m_statusClipboard;
     QLabel* m_statusPanel;
+    QLabel* m_statusClock = nullptr;   // 右下角：实时日期时间（QTimer 每秒刷新）
 
     // ----- 应用状态 -----
     std::optional<ClipboardData> m_clipboard;       // 应用内剪贴板（与系统剪贴板独立）

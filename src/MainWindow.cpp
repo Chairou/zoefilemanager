@@ -34,6 +34,8 @@
 #include <QCloseEvent>
 #include <QInputDialog>
 #include <QRegularExpression>
+#include <QDateTime>
+#include <QTimer>
 
 // ---------------------------------------------------------------------------
 // 构造：组装整个 UI 树。顺序大致是：
@@ -303,11 +305,27 @@ void MainWindow::setupStatusBar() {
     m_statusRight = new QLabel();
     m_statusClipboard = new QLabel();
     m_statusPanel = new QLabel();
+    m_statusClock = new QLabel();
 
     statusBar()->addWidget(m_statusLeft, 1);
     statusBar()->addWidget(m_statusRight, 1);
     statusBar()->addWidget(m_statusClipboard, 1);
     statusBar()->addPermanentWidget(m_statusPanel);
+    // Permanent widgets 从右侧开始堆叠；最后 add 的会在最右。
+    // 让时钟在最右下角。
+    statusBar()->addPermanentWidget(m_statusClock);
+
+    // 每秒刷新时钟；格式：yyyy-MM-dd HH:mm:ss
+    auto updateClock = [this]() {
+        if (m_statusClock) {
+            m_statusClock->setText(
+                QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss"));
+        }
+    };
+    updateClock();  // 立即显示一次，避免启动后 1 秒内空白
+    auto* clockTimer = new QTimer(this);
+    connect(clockTimer, &QTimer::timeout, this, updateClock);
+    clockTimer->start(1000);
 }
 
 // 全局快捷键：Cmd+C / Cmd+X / Cmd+V / Cmd+A / Backspace / Cmd+L 等。
