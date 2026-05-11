@@ -11,6 +11,10 @@
 #include <QDir>
 #include <QSignalBlocker>
 #include <QAbstractItemView>
+#include <QScrollBar>
+#include <QRect>
+#include <QTimer>
+#include <QFontMetrics>
 
 DirectoryTree::DirectoryTree(QWidget* parent)
     : QTreeWidget(parent)
@@ -266,4 +270,40 @@ void DirectoryTree::revealPath(const QString& path) {
     QSignalBlocker blocker(this);
     setCurrentItem(item);
     scrollToItem(item, QAbstractItemView::PositionAtCenter);
+
+    // 水平 + 垂直居中（延迟一轮事件循环）
+    //
+    // 顺序非常关键：
+    //   1) 先 scrollToItem(PositionAtCenter) —— 它会做垂直居中，**同时**
+    //      还会做一次水平的 "auto ensure-visible"，把项拉到视口靠左可见。
+    //      这一步必须最先做，否则随后我们设置的水平 value 会被它覆盖。
+    //   2) 再手动 setValue 修正水平滚动 —— 水平 setValue 只影响水平位置，
+    //      不会改变垂直位置，所以不会破坏步骤 1 的垂直居中。
+    //
+    // 为什么放在 singleShot(0) 里：scrollToItem 触发水平滚动条
+    // AsNeeded 的出现/隐藏会改变 viewport 高度 → 触发布局。延迟到下一轮
+    // 事件循环可以让布局稳定，visualRect / hbar->maximum() 返回最终值。
+    QTimer::singleShot(0, this, [this, item]() {
+        QModelIndex idx = indexFromItem(item, 0);
+        if (!idx.isValid()) return;
+
+        // 第 1 步：再次强制垂直居中（+ Qt 内部的水平可见调整）。
+        scrollToItem(item, QAbstractItemView::PositionAtCenter);
+
+        // 第 2 步：用 setValue 覆盖 Qt 的水平定位，做真·水平居中。
+        auto* hbar = horizontalScrollBar();
+        if (!hbar || hbar->maximum() <= 0) return;
+
+        QRect vr = visualRect(idx);
+        const int textStartX = vr.left();
+        const int textPixWidth =
+            fontMetrics().horizontalAdvance(item->text(0)) + 24;
+        const int itemCenterInViewport = textStartX + textPixWidth / 2;
+        const int viewportW = viewport()->width();
+        const int delta = itemCenterInViewport - viewportW / 2;
+        const int newVal = qBound(hbar->minimum(),
+                                  hbar->value() + delta,
+                                  hbar->maximum());
+        hbar->setValue(newVal);
+    });
 }

@@ -80,6 +80,11 @@ private slots:
     void onCreateNewFile(const QString& dir, bool isRemote);
     void onCreateNewFolder(const QString& dir, bool isRemote);
 
+    // ----- 右键菜单：重命名 -----
+    // 对 selected 条目做重命名：弹 QInputDialog，校验非法字符，
+    // 目标同名时提示用户覆盖/取消；远程路径暂不支持。
+    void onRenameEntry(const QString& oldPath);
+
     // ----- 来自子组件的回调 -----
     void onPanelPathChanged(const QString& path, PanelSide side);
     void onPanelSelectionChanged(PanelSide side);

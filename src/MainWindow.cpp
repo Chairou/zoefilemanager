@@ -1351,6 +1351,17 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
     menu.addAction("Cut\tCtrl+X", this, &MainWindow::onCut);
     menu.addAction("Paste\tCtrl+V", this, &MainWindow::onPaste);
     menu.addSeparator();
+    // Rename 仅在恰好选中 1 项时启用（多选重命名语义不明确）。
+    {
+        QAction* renameAct = menu.addAction("Rename…");
+        if (sel.size() == 1) {
+            const QString targetPath = sel.first().path;
+            connect(renameAct, &QAction::triggered, this,
+                [this, targetPath]() { onRenameEntry(targetPath); });
+        } else {
+            renameAct->setEnabled(false);
+        }
+    }
     menu.addAction("Delete\tDel", this, &MainWindow::onDelete);
     menu.addSeparator();
     menu.addAction("Copy Path", this, &MainWindow::onCopyPath);
@@ -1507,6 +1518,76 @@ void MainWindow::onCreateNewFolder(const QString& dir, bool isRemote) {
 
     activePanel()->refresh();
     statusBar()->showMessage(QString("Created: %1").arg(finalName), 2000);
+}
+
+// 重命名：把 oldPath 改成用户输入的名字（同目录内）。
+// - 远程（sftp:// 等）路径暂不支持
+// - 非法字符检查复用 hasInvalidNameChars
+// - 与已存在名冲突：提示覆盖 / 取消（只对文件提示覆盖；目录冲突直接拒绝避免误合并）
+void MainWindow::onRenameEntry(const QString& oldPath) {
+    if (oldPath.isEmpty()) return;
+
+    if (FileSystemRouter::instance().isRemote(oldPath)) {
+        QMessageBox::information(this, "Not Supported",
+            "Renaming on remote paths is not supported yet.");
+        return;
+    }
+
+    QFileInfo fi(oldPath);
+    if (!fi.exists()) {
+        QMessageBox::warning(this, "Rename Failed", "The item no longer exists.");
+        activePanel()->refresh();
+        return;
+    }
+
+    const QString oldName = fi.fileName();
+    const QString dir = fi.absolutePath();
+    const bool isDir = fi.isDir();
+
+    bool ok = false;
+    QString newName = QInputDialog::getText(this,
+        isDir ? "Rename Folder" : "Rename File",
+        "New name:", QLineEdit::Normal,
+        oldName, &ok).trimmed();
+    if (!ok || newName.isEmpty()) return;
+    if (newName == oldName) return;  // 无改动
+
+    if (hasInvalidNameChars(newName)) {
+        QMessageBox::warning(this, "Invalid Name",
+            "Name contains invalid characters.");
+        return;
+    }
+
+    const QString newPath = QDir(dir).filePath(newName);
+
+    // 冲突处理
+    if (QFileInfo::exists(newPath)) {
+        if (isDir || QFileInfo(newPath).isDir()) {
+            QMessageBox::warning(this, "Rename Failed",
+                QString("A folder or file named \"%1\" already exists.").arg(newName));
+            return;
+        }
+        auto ret = QMessageBox::question(this, "Overwrite?",
+            QString("A file named \"%1\" already exists.\nOverwrite it?").arg(newName),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (ret != QMessageBox::Yes) return;
+        if (!QFile::remove(newPath)) {
+            QMessageBox::warning(this, "Rename Failed",
+                "Cannot remove the existing file to overwrite.");
+            return;
+        }
+    }
+
+    // 执行 rename：QFile::rename 对文件/目录都适用（调用 POSIX rename）
+    if (!QFile::rename(oldPath, newPath)) {
+        QMessageBox::warning(this, "Rename Failed",
+            QString("Cannot rename \"%1\" to \"%2\".").arg(oldName, newName));
+        return;
+    }
+
+    activePanel()->refresh();
+    statusBar()->showMessage(
+        QString("Renamed: %1 → %2").arg(oldName, newName), 2000);
 }
 
 // 重新计算状态栏四个 label 的内容（条目数 / 选中数 / 剪贴板 / 活跃面板）
