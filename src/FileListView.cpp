@@ -4,6 +4,7 @@
 
 #include "FileListView.h"
 #include "FileSystemRouter.h"
+#include "I18n.h"
 #include <QHeaderView>
 #include <QMouseEvent>
 #include <QKeyEvent>
@@ -63,11 +64,17 @@ FileListView::FileListView(QWidget* parent)
     connect(this, &QTableWidget::cellDoubleClicked, this, &FileListView::onCellDoubleClicked);
     connect(this, &QTableWidget::customContextMenuRequested, this, &FileListView::onCustomContextMenu);
     connect(horizontalHeader(), &QHeaderView::sectionClicked, this, &FileListView::onHeaderClicked);
+
+    connect(&I18n::instance(), &I18n::changed, this, &FileListView::retranslate);
+}
+
+void FileListView::retranslate() {
+    setHorizontalHeaderLabels({T("Name"), T("Size"), T("Modified"), T("Permissions")});
 }
 
 void FileListView::setupColumns() {
     setColumnCount(4);
-    setHorizontalHeaderLabels({"Name", "Size", "Modified", "Permissions"});
+    setHorizontalHeaderLabels({T("Name"), T("Size"), T("Modified"), T("Permissions")});
     horizontalHeader()->resizeSection(0, 300);
     horizontalHeader()->resizeSection(1, 100);
     horizontalHeader()->resizeSection(2, 150);

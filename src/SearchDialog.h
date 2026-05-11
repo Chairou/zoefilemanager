@@ -33,6 +33,7 @@ signals:
 private slots:
     void performSearch();
     void onResultDoubleClicked(QListWidgetItem* item);
+    void retranslate();
 
 private:
     QLineEdit* m_queryInput;
@@ -40,6 +41,9 @@ private:
     QPushButton* m_searchBtn;
     QListWidget* m_resultsList;
     QLabel* m_statusLabel;
+    class QLabel* m_searchLabel = nullptr;  // "Search:"
+    class QLabel* m_pathLabel = nullptr;    // "In path:"
+    int m_lastResultCount = -1;             // retranslate 时复原 "Found N results"
 };
 
 #endif // SEARCHDIALOG_H

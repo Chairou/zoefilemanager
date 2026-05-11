@@ -36,6 +36,9 @@
 #include <QRegularExpression>
 #include <QDateTime>
 #include <QTimer>
+#include "I18n.h"
+#include "AppFonts.h"
+#include "SettingsDialog.h"
 
 // ---------------------------------------------------------------------------
 // 构造：组装整个 UI 树。顺序大致是：
@@ -115,8 +118,8 @@ MainWindow::MainWindow(QWidget* parent)
     // 这是 Qt 平台集成的默认行为；Linux/Windows 上会留在 "Help" 菜单。
     // 这一项满足 LGPLv3 的 "appropriate copyright notice" 义务。
     {
-        QMenu* helpMenu = menuBar()->addMenu("Help");
-        QAction* about = helpMenu->addAction("About Zoe File Manager");
+        QMenu* helpMenu = menuBar()->addMenu(T("Help"));
+        QAction* about = helpMenu->addAction(T("About Zoe File Manager"));
         // Qt 默认把 ApplicationRole 的 action 移到 macOS 应用菜单下
         about->setMenuRole(QAction::AboutRole);
         connect(about, &QAction::triggered, this, [this]() {
@@ -261,42 +264,135 @@ void MainWindow::closeEvent(QCloseEvent* event) {
 // 修改文本时注意保持 UTF-8 字节序列正确。
 void MainWindow::setupToolbar() {
     auto* toolbar = addToolBar("Main");
+    m_toolbar = toolbar;
     toolbar->setMovable(false);
     toolbar->setIconSize(QSize(20, 20));
 
-    m_backAction = toolbar->addAction("\xE2\x86\x90 Back", this, &MainWindow::onBack);
-    m_forwardAction = toolbar->addAction("\xE2\x86\x92 Fwd", this, &MainWindow::onForward);
-    m_upAction = toolbar->addAction("\xE2\x86\x91 Up", this, &MainWindow::onUp);
-    m_refreshAction = toolbar->addAction("\xE2\x9F\xB3 Refresh", this, &MainWindow::onRefresh);
+    m_backAction = toolbar->addAction(T("\xE2\x86\x90 Back"), this, &MainWindow::onBack);
+    m_forwardAction = toolbar->addAction(T("\xE2\x86\x92 Fwd"), this, &MainWindow::onForward);
+    m_upAction = toolbar->addAction(T("\xE2\x86\x91 Up"), this, &MainWindow::onUp);
+    m_refreshAction = toolbar->addAction(T("\xE2\x9F\xB3 Refresh"), this, &MainWindow::onRefresh);
 
     toolbar->addSeparator();
 
-    m_copyAction = toolbar->addAction("Copy", this, &MainWindow::onCopy);
-    m_cutAction = toolbar->addAction("Cut", this, &MainWindow::onCut);
-    m_pasteAction = toolbar->addAction("Paste", this, &MainWindow::onPaste);
-    m_deleteAction = toolbar->addAction("Delete", this, &MainWindow::onDelete);
+    m_copyAction = toolbar->addAction(T("Copy"), this, &MainWindow::onCopy);
+    m_cutAction = toolbar->addAction(T("Cut"), this, &MainWindow::onCut);
+    m_pasteAction = toolbar->addAction(T("Paste"), this, &MainWindow::onPaste);
+    m_deleteAction = toolbar->addAction(T("Delete"), this, &MainWindow::onDelete);
 
     toolbar->addSeparator();
 
-    m_selectAllAction = toolbar->addAction("Select All", this, &MainWindow::onSelectAll);
-    m_copyPathAction = toolbar->addAction("Copy Path", this, &MainWindow::onCopyPath);
-    m_runScriptAction = toolbar->addAction("Script", this, &MainWindow::onRunScript);
-    m_searchAction = toolbar->addAction("Search", this, &MainWindow::onSearch);
+    m_selectAllAction = toolbar->addAction(T("Select All"), this, &MainWindow::onSelectAll);
+    m_copyPathAction = toolbar->addAction(T("Copy Path"), this, &MainWindow::onCopyPath);
+    m_runScriptAction = toolbar->addAction(T("Script"), this, &MainWindow::onRunScript);
+    m_searchAction = toolbar->addAction(T("Search"), this, &MainWindow::onSearch);
 
     toolbar->addSeparator();
 
-    m_remoteConnectAction = toolbar->addAction("Connect", this, &MainWindow::onRemoteConnect);
-    m_remoteDisconnectAction = toolbar->addAction("Disconnect", this, &MainWindow::onRemoteDisconnect);
+    m_remoteConnectAction = toolbar->addAction(T("Connect"), this, &MainWindow::onRemoteConnect);
+    m_remoteDisconnectAction = toolbar->addAction(T("Disconnect"), this, &MainWindow::onRemoteDisconnect);
     m_remoteDisconnectAction->setEnabled(false);
 
     toolbar->addSeparator();
 
-    m_hiddenAction = toolbar->addAction("\xE2\x97\x89 Hidden", this, &MainWindow::onToggleHidden);
+    m_hiddenAction = toolbar->addAction(T("\xE2\x97\x89 Hidden"), this, &MainWindow::onToggleHidden);
     m_hiddenAction->setCheckable(true);
     m_hiddenAction->setChecked(RealFileSystem::instance().showHidden());
     m_hiddenAction->setToolTip("Show/hide dot-files (files starting with '.')");
 
-    m_themeAction = toolbar->addAction("Theme: Dark", this, &MainWindow::onToggleTheme);
+    m_themeAction = toolbar->addAction(T("Theme: Dark"), this, &MainWindow::onToggleTheme);
+
+    // 推到右侧：Settings 按钮靠最右端显示
+    auto* spacer = new QWidget(toolbar);
+    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    toolbar->addWidget(spacer);
+    m_settingsAction = toolbar->addAction(T("Settings"), this, &MainWindow::onOpenSettings);
+
+    // 语言切换时重新翻译整个 UI
+    connect(&I18n::instance(), &I18n::changed,
+            this, &MainWindow::retranslateUi);
+    // 字号变化时刷新工具栏/菜单/面板/目录树字号
+    connect(&AppFonts::instance(), &AppFonts::changed,
+            this, &MainWindow::applyFonts);
+}
+
+// 打开设置对话框（语言切换等）。OK 后 I18n 会 emit changed()，
+// 进而触发 retranslateUi() 即时更新 UI。
+void MainWindow::onOpenSettings() {
+    SettingsDialog dlg(this);
+    dlg.exec();
+}
+
+// 重新翻译所有可见 UI 文本。
+// 只翻译主窗口自己负责装配的部分（工具栏 + Help 菜单 + 状态栏模板）。
+// 右键菜单在弹出时每次重新构造，已用 T() 包裹，无需 retranslate。
+// 各子对话框（Search/Remote/Script/About/Settings）自己负责 retranslate。
+void MainWindow::retranslateUi() {
+    if (m_backAction)           m_backAction->setText(T("\xE2\x86\x90 Back"));
+    if (m_forwardAction)        m_forwardAction->setText(T("\xE2\x86\x92 Fwd"));
+    if (m_upAction)             m_upAction->setText(T("\xE2\x86\x91 Up"));
+    if (m_refreshAction)        m_refreshAction->setText(T("\xE2\x9F\xB3 Refresh"));
+    if (m_copyAction)           m_copyAction->setText(T("Copy"));
+    if (m_cutAction)            m_cutAction->setText(T("Cut"));
+    if (m_pasteAction)          m_pasteAction->setText(T("Paste"));
+    if (m_deleteAction)         m_deleteAction->setText(T("Delete"));
+    if (m_selectAllAction)      m_selectAllAction->setText(T("Select All"));
+    if (m_copyPathAction)       m_copyPathAction->setText(T("Copy Path"));
+    if (m_runScriptAction)      m_runScriptAction->setText(T("Script"));
+    if (m_searchAction)         m_searchAction->setText(T("Search"));
+    if (m_remoteConnectAction)  m_remoteConnectAction->setText(T("Connect"));
+    if (m_remoteDisconnectAction) m_remoteDisconnectAction->setText(T("Disconnect"));
+    if (m_hiddenAction)         m_hiddenAction->setText(T("\xE2\x97\x89 Hidden"));
+    if (m_themeAction) {
+        m_themeAction->setText(m_isDarkTheme ? T("Theme: Dark") : T("Theme: Light"));
+    }
+    if (m_settingsAction)       m_settingsAction->setText(T("Settings"));
+
+    // 字号同步与状态栏刷新
+    applyFonts();
+    updateStatusBar();
+}
+
+// 把 AppFonts 当前字号应用到工具栏 / 菜单栏 / 面板（FileListView）/ 目录树。
+// 由 retranslateUi 和 AppFonts::changed 信号双重触发。
+void MainWindow::applyFonts() {
+    const int menuPt = AppFonts::instance().effectiveMenuFontSize();
+
+    // ---- 工具栏：QToolBar::setFont 不会传给内部 QToolButton。
+    //      必须遍历每个 action 的对应 widget 单独 setFont，且对 toolbar 自身
+    //      也设一次（影响溢出按钮/spacer 等）。
+    if (m_toolbar) {
+        QFont f = m_toolbar->font();
+        if (menuPt > 0) f.setPointSize(menuPt); else f = QFont();
+        m_toolbar->setFont(f);
+        const auto actions = m_toolbar->actions();
+        for (QAction* a : actions) {
+            if (QWidget* w = m_toolbar->widgetForAction(a)) {
+                QFont wf = w->font();
+                if (menuPt > 0) wf.setPointSize(menuPt); else wf = QFont();
+                w->setFont(wf);
+            }
+        }
+    }
+    if (menuBar()) {
+        QFont mf = menuBar()->font();
+        if (menuPt > 0) mf.setPointSize(menuPt); else mf = QFont();
+        menuBar()->setFont(mf);
+    }
+
+    const int itemPt = AppFonts::instance().effectiveItemFontSize();
+    auto applyItemFont = [&](QWidget* w) {
+        if (!w) return;
+        QFont f = w->font();
+        if (itemPt > 0) f.setPointSize(itemPt); else f = QFont();
+        w->setFont(f);
+    };
+    // 文件面板（左/右）：FilePanel 自身没暴露 fileList，但 setFont 在
+    // FilePanel 上 Qt 会传播给所有子部件 —— 包括 FileListView 表头与 cell。
+    applyItemFont(m_leftPanel);
+    applyItemFont(m_rightPanel);
+    // 目录树
+    applyItemFont(m_dirTree);
 }
 
 // 状态栏：四个 QLabel 平铺，分别显示左面板信息、右面板信息、剪贴板状态、活跃面板提示
@@ -1120,10 +1216,10 @@ void MainWindow::onToggleTheme() {
     m_isDarkTheme = !m_isDarkTheme;
     if (m_isDarkTheme) {
         applyDarkTheme();
-        m_themeAction->setText("Theme: Dark");
+        m_themeAction->setText(T("Theme: Dark"));
     } else {
         applyLightTheme();
-        m_themeAction->setText("Theme: Light");
+        m_themeAction->setText(T("Theme: Light"));
     }
 }
 
@@ -1300,6 +1396,15 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
     m_activePane = side;
 
     QMenu menu(this);
+    // 把右键菜单字号同步到全局 menu 字号（AppFonts），保持一致。
+    {
+        const int pt = AppFonts::instance().effectiveMenuFontSize();
+        if (pt > 0) {
+            QFont mf = menu.font();
+            mf.setPointSize(pt);
+            menu.setFont(mf);
+        }
+    }
 
     // ---- "Open With" / "Open" 子菜单（仅单选本地文件时展示） ----
     QVector<FileEntry> sel = activePanel()->getSelectedEntries();
@@ -1315,15 +1420,15 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
 
     if (canOfferOpenWith) {
         // "Open" 顶层项 = 双击行为（系统默认应用）
-        menu.addAction("Open", this, [openTargetPath]() {
+        menu.addAction(T("Open"), this, [openTargetPath]() {
             openWithDefault(openTargetPath);
         });
 
         // "Open With ▶" 子菜单：列出已安装的常用应用 + "其它..."
-        QMenu* openWithMenu = menu.addMenu("Open With");
+        QMenu* openWithMenu = menu.addMenu(T("Open With"));
 
         // Finder 风格的"默认应用"放在子菜单顶端
-        openWithMenu->addAction("Default Application", this,
+        openWithMenu->addAction(T("Default Application"), this,
             [openTargetPath]() { openWithDefault(openTargetPath); });
         openWithMenu->addSeparator();
 
@@ -1339,7 +1444,7 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
 
         if (!apps.isEmpty()) openWithMenu->addSeparator();
 
-        openWithMenu->addAction("Other Application…", this,
+        openWithMenu->addAction(T("Other Application…"), this,
             [openTargetPath]() { chooseAndOpen(openTargetPath); });
 
         menu.addSeparator();
@@ -1353,10 +1458,10 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
         const QString cwd = activePanel()->currentPath();
         const bool isRemote = FileSystemRouter::instance().isRemote(cwd);
 
-        menu.addAction("New File…", this, [this, cwd, isRemote]() {
+        menu.addAction(T("New File…"), this, [this, cwd, isRemote]() {
             onCreateNewFile(cwd, isRemote);
         });
-        menu.addAction("New Folder…", this, [this, cwd, isRemote]() {
+        menu.addAction(T("New Folder…"), this, [this, cwd, isRemote]() {
             onCreateNewFolder(cwd, isRemote);
         });
         menu.addSeparator();
@@ -1365,13 +1470,13 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
     // NOTE: "\tCtrl+X" in Qt QAction text is auto-translated to "⌘X" display
     // on macOS. The actual QShortcut bindings are registered in setupShortcuts()
     // using Qt::CTRL | Qt::Key_X (which maps to Cmd on macOS, Ctrl elsewhere).
-    menu.addAction("Copy\tCtrl+C", this, &MainWindow::onCopy);
-    menu.addAction("Cut\tCtrl+X", this, &MainWindow::onCut);
-    menu.addAction("Paste\tCtrl+V", this, &MainWindow::onPaste);
+    menu.addAction(TS("Copy\tCtrl+C"), this, &MainWindow::onCopy);
+    menu.addAction(TS("Cut\tCtrl+X"), this, &MainWindow::onCut);
+    menu.addAction(TS("Paste\tCtrl+V"), this, &MainWindow::onPaste);
     menu.addSeparator();
     // Rename 仅在恰好选中 1 项时启用（多选重命名语义不明确）。
     {
-        QAction* renameAct = menu.addAction("Rename…");
+        QAction* renameAct = menu.addAction(T("Rename…"));
         if (sel.size() == 1) {
             const QString targetPath = sel.first().path;
             connect(renameAct, &QAction::triggered, this,
@@ -1380,10 +1485,10 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
             renameAct->setEnabled(false);
         }
     }
-    menu.addAction("Delete\tDel", this, &MainWindow::onDelete);
+    menu.addAction(TS("Delete\tDel"), this, &MainWindow::onDelete);
     menu.addSeparator();
-    menu.addAction("Copy Path", this, &MainWindow::onCopyPath);
-    menu.addAction("Copy File Name", this, [this]() {
+    menu.addAction(T("Copy Path"), this, &MainWindow::onCopyPath);
+    menu.addAction(T("Copy File Name"), this, [this]() {
         auto selected = activePanel()->getSelectedEntries();
         if (!selected.isEmpty()) {
             QStringList names;
@@ -1391,7 +1496,7 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
                 names.append(e.name);
             }
             QApplication::clipboard()->setText(names.join("\n"));
-            statusBar()->showMessage("File name(s) copied", 2000);
+            statusBar()->showMessage(T("File name(s) copied"), 2000);
         }
     });
     menu.addSeparator();
@@ -1405,13 +1510,15 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
     }
     if (hasLocalSelection) {
         const QString label = (sel.size() == 1)
-            ? QString("Compress \"%1\" to ZIP").arg(sel.first().name)
-            : QString("Compress %1 items to ZIP").arg(sel.size());
+            ? QString(I18n::instance().current() == I18n::Lang::Zh
+                      ? "压缩 \"%1\" 为 ZIP" : "Compress \"%1\" to ZIP").arg(sel.first().name)
+            : QString(I18n::instance().current() == I18n::Lang::Zh
+                      ? "压缩 %1 项为 ZIP" : "Compress %1 items to ZIP").arg(sel.size());
         menu.addAction(label, this, &MainWindow::onCompressZip);
         menu.addSeparator();
     }
 
-    menu.addAction("Run Script\tCtrl+E", this, &MainWindow::onRunScript);
+    menu.addAction(TS("Run Script\tCtrl+E"), this, &MainWindow::onRunScript);
 
     menu.exec(pos);
 }
@@ -1475,20 +1582,20 @@ QString uniqueName(const QString& dir, const QString& desired, bool isFile) {
 
 void MainWindow::onCreateNewFile(const QString& dir, bool isRemote) {
     if (isRemote) {
-        QMessageBox::information(this, "Not Supported",
-            "Creating files/folders on remote paths is not supported yet.");
+        QMessageBox::information(this, T("Not Supported"),
+            T("Creating files/folders on remote paths is not supported yet."));
         return;
     }
 
     bool ok = false;
     QString name = QInputDialog::getText(this,
-        "New File", "Name:", QLineEdit::Normal,
+        T("New File"), T("Name:"), QLineEdit::Normal,
         "untitled.txt", &ok).trimmed();
     if (!ok || name.isEmpty()) return;
 
     if (hasInvalidNameChars(name)) {
-        QMessageBox::warning(this, "Invalid Name",
-            "Name contains invalid characters.");
+        QMessageBox::warning(this, T("Invalid Name"),
+            T("Name contains invalid characters."));
         return;
     }
 
@@ -1497,32 +1604,34 @@ void MainWindow::onCreateNewFile(const QString& dir, bool isRemote) {
 
     QFile f(full);
     if (!f.open(QIODevice::WriteOnly)) {
-        QMessageBox::warning(this, "Create Failed",
+        QMessageBox::warning(this, T("Create Failed"),
             QString("Cannot create file: %1").arg(f.errorString()));
         return;
     }
     f.close();
 
     activePanel()->refresh();
-    statusBar()->showMessage(QString("Created: %1").arg(finalName), 2000);
+    statusBar()->showMessage(
+        QString(I18n::instance().current() == I18n::Lang::Zh
+                ? "已创建：%1" : "Created: %1").arg(finalName), 2000);
 }
 
 void MainWindow::onCreateNewFolder(const QString& dir, bool isRemote) {
     if (isRemote) {
-        QMessageBox::information(this, "Not Supported",
-            "Creating files/folders on remote paths is not supported yet.");
+        QMessageBox::information(this, T("Not Supported"),
+            T("Creating files/folders on remote paths is not supported yet."));
         return;
     }
 
     bool ok = false;
     QString name = QInputDialog::getText(this,
-        "New Folder", "Name:", QLineEdit::Normal,
+        T("New Folder"), T("Name:"), QLineEdit::Normal,
         "untitled folder", &ok).trimmed();
     if (!ok || name.isEmpty()) return;
 
     if (hasInvalidNameChars(name)) {
-        QMessageBox::warning(this, "Invalid Name",
-            "Name contains invalid characters.");
+        QMessageBox::warning(this, T("Invalid Name"),
+            T("Name contains invalid characters."));
         return;
     }
 
@@ -1530,12 +1639,14 @@ void MainWindow::onCreateNewFolder(const QString& dir, bool isRemote) {
     const QString full = QDir(dir).filePath(finalName);
 
     if (!QDir().mkdir(full)) {
-        QMessageBox::warning(this, "Create Failed", "Cannot create folder.");
+        QMessageBox::warning(this, T("Create Failed"), T("Cannot create folder."));
         return;
     }
 
     activePanel()->refresh();
-    statusBar()->showMessage(QString("Created: %1").arg(finalName), 2000);
+    statusBar()->showMessage(
+        QString(I18n::instance().current() == I18n::Lang::Zh
+                ? "已创建：%1" : "Created: %1").arg(finalName), 2000);
 }
 
 // 重命名：把 oldPath 改成用户输入的名字（同目录内）。
@@ -1546,14 +1657,14 @@ void MainWindow::onRenameEntry(const QString& oldPath) {
     if (oldPath.isEmpty()) return;
 
     if (FileSystemRouter::instance().isRemote(oldPath)) {
-        QMessageBox::information(this, "Not Supported",
-            "Renaming on remote paths is not supported yet.");
+        QMessageBox::information(this, T("Not Supported"),
+            T("Renaming on remote paths is not supported yet."));
         return;
     }
 
     QFileInfo fi(oldPath);
     if (!fi.exists()) {
-        QMessageBox::warning(this, "Rename Failed", "The item no longer exists.");
+        QMessageBox::warning(this, T("Rename Failed"), T("The item no longer exists."));
         activePanel()->refresh();
         return;
     }
@@ -1564,48 +1675,53 @@ void MainWindow::onRenameEntry(const QString& oldPath) {
 
     bool ok = false;
     QString newName = QInputDialog::getText(this,
-        isDir ? "Rename Folder" : "Rename File",
-        "New name:", QLineEdit::Normal,
+        isDir ? T("Rename Folder") : T("Rename File"),
+        T("New name:"), QLineEdit::Normal,
         oldName, &ok).trimmed();
     if (!ok || newName.isEmpty()) return;
     if (newName == oldName) return;  // 无改动
 
     if (hasInvalidNameChars(newName)) {
-        QMessageBox::warning(this, "Invalid Name",
-            "Name contains invalid characters.");
+        QMessageBox::warning(this, T("Invalid Name"),
+            T("Name contains invalid characters."));
         return;
     }
 
     const QString newPath = QDir(dir).filePath(newName);
+    const bool zh = (I18n::instance().current() == I18n::Lang::Zh);
 
     // 冲突处理
     if (QFileInfo::exists(newPath)) {
         if (isDir || QFileInfo(newPath).isDir()) {
-            QMessageBox::warning(this, "Rename Failed",
-                QString("A folder or file named \"%1\" already exists.").arg(newName));
+            QMessageBox::warning(this, T("Rename Failed"),
+                QString(zh ? "名为 \"%1\" 的文件或文件夹已存在。"
+                           : "A folder or file named \"%1\" already exists.").arg(newName));
             return;
         }
-        auto ret = QMessageBox::question(this, "Overwrite?",
-            QString("A file named \"%1\" already exists.\nOverwrite it?").arg(newName),
+        auto ret = QMessageBox::question(this, T("Overwrite?"),
+            QString(zh ? "名为 \"%1\" 的文件已存在。\n是否覆盖？"
+                       : "A file named \"%1\" already exists.\nOverwrite it?").arg(newName),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (ret != QMessageBox::Yes) return;
         if (!QFile::remove(newPath)) {
-            QMessageBox::warning(this, "Rename Failed",
-                "Cannot remove the existing file to overwrite.");
+            QMessageBox::warning(this, T("Rename Failed"),
+                zh ? "无法删除已存在的文件以覆盖。"
+                   : "Cannot remove the existing file to overwrite.");
             return;
         }
     }
 
     // 执行 rename：QFile::rename 对文件/目录都适用（调用 POSIX rename）
     if (!QFile::rename(oldPath, newPath)) {
-        QMessageBox::warning(this, "Rename Failed",
-            QString("Cannot rename \"%1\" to \"%2\".").arg(oldName, newName));
+        QMessageBox::warning(this, T("Rename Failed"),
+            QString(zh ? "无法将 \"%1\" 重命名为 \"%2\"。"
+                       : "Cannot rename \"%1\" to \"%2\".").arg(oldName, newName));
         return;
     }
 
     activePanel()->refresh();
     statusBar()->showMessage(
-        QString("Renamed: %1 → %2").arg(oldName, newName), 2000);
+        QString(zh ? "已重命名：%1 → %2" : "Renamed: %1 → %2").arg(oldName, newName), 2000);
 }
 
 // 重新计算状态栏四个 label 的内容（条目数 / 选中数 / 剪贴板 / 活跃面板）
@@ -1632,7 +1748,10 @@ void MainWindow::updateStatusBar() {
     else if (totalSize < 1024LL * 1024 * 1024) sizeStr = QString::number(totalSize / (1024.0 * 1024.0), 'f', 1) + " MB";
     else sizeStr = QString::number(totalSize / (1024.0 * 1024.0 * 1024.0), 'f', 1) + " GB";
 
-    m_statusLeft->setText(QString("%1 folders, %2 files (%3)").arg(folderCount).arg(fileCount).arg(sizeStr));
+    m_statusLeft->setText(QString("%1 %2, %3 %4 (%5)")
+        .arg(folderCount).arg(T("folders"))
+        .arg(fileCount).arg(T("files"))
+        .arg(sizeStr));
 
     // Selection info
     auto selected = activePanel()->getSelectedEntries();
@@ -1643,21 +1762,25 @@ void MainWindow::updateStatusBar() {
         if (selSize < 1024) selSizeStr = QString::number(selSize) + " B";
         else if (selSize < 1024 * 1024) selSizeStr = QString::number(selSize / 1024.0, 'f', 1) + " KB";
         else selSizeStr = QString::number(selSize / (1024.0 * 1024.0), 'f', 1) + " MB";
-        m_statusRight->setText(QString("Selected: %1 item(s), %2").arg(selected.size()).arg(selSizeStr));
+        m_statusRight->setText(QString("%1 %2 %3, %4")
+            .arg(T("Selected:")).arg(selected.size()).arg(T("item(s)")).arg(selSizeStr));
     } else {
         m_statusRight->setText("");
     }
 
     // Clipboard info
     if (m_clipboard.has_value()) {
-        QString action = m_clipboard->isCut ? "Cut" : "Copied";
-        m_statusClipboard->setText(QString("Clipboard: %1 %2 item(s)").arg(action).arg(m_clipboard->entries.size()));
+        QString action = m_clipboard->isCut ? T("Cut") : T("Copy");
+        m_statusClipboard->setText(QString("%1 %2 %3 %4")
+            .arg(T("Clipboard:")).arg(action).arg(m_clipboard->entries.size()).arg(T("item(s)")));
     } else {
         m_statusClipboard->setText("");
     }
 
     // Active panel
-    QString panelStr = (m_activePane == PanelSide::Left) ? "Left Panel" : "Right Panel";
+    QString panelStr = QString("%1 %2")
+        .arg(T("Panel:"))
+        .arg(m_activePane == PanelSide::Left ? T("Left") : T("Right"));
     if (m_isRemoteConnected) panelStr += " [Remote]";
     m_statusPanel->setText(panelStr);
 }

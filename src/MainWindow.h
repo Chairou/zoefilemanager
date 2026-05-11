@@ -73,6 +73,9 @@ private slots:
     void onRemoteDisconnect(); // 拆挂载，回到 home
     void onToggleTheme();      // 暗/亮主题切换
     void onToggleHidden();     // 显示/隐藏点文件
+    void onOpenSettings();     // 打开"设置"对话框（语言等）
+    void retranslateUi();      // I18n 语言切换时重新翻译所有可见 UI 文本
+    void applyFonts();         // 字号变化时同步工具栏/菜单/面板/目录树
 
     // ----- 右键菜单：新建文件 / 新建目录 -----
     // dir 为目标目录（active panel 的 currentPath）；isRemote 为 router.isRemote(dir)。
@@ -140,6 +143,8 @@ private:
     QAction* m_remoteDisconnectAction;
     QAction* m_themeAction;
     QAction* m_hiddenAction;
+    QAction* m_settingsAction = nullptr;
+    class QToolBar* m_toolbar = nullptr;
 
     // ----- 状态栏标签 -----
     QLabel* m_statusLeft;

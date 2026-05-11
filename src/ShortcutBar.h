@@ -20,6 +20,7 @@
 class QVBoxLayout;
 class QScrollArea;
 class QPushButton;
+class QLabel;
 
 /// 单个快捷方式：显示名 + 绝对路径
 struct ShortcutItem {
@@ -44,6 +45,7 @@ signals:
 
 private slots:
     void onAddClicked();
+    void retranslate();
 
 private:
     void rebuildButtons();
@@ -54,6 +56,7 @@ private:
 
     QVBoxLayout* m_listLayout = nullptr;  // 装快捷按钮的纵向布局
     QPushButton* m_addBtn = nullptr;
+    QLabel*      m_title = nullptr;       // "SHORTCUTS" 标题
     QVector<ShortcutItem> m_items;
 };
 

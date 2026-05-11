@@ -6,6 +6,7 @@
 // =============================================================================
 
 #include "ShortcutBar.h"
+#include "I18n.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QScrollArea>
@@ -31,23 +32,23 @@ public:
                       const QString& initialPath = "")
         : QDialog(parent)
     {
-        setWindowTitle(initialPath.isEmpty() ? "Add shortcut" : "Edit shortcut");
+        setWindowTitle(initialPath.isEmpty() ? T("Add shortcut") : T("Edit shortcut"));
         setMinimumWidth(420);
 
         auto* layout = new QVBoxLayout(this);
 
-        layout->addWidget(new QLabel("Name (optional, defaults to folder name):"));
+        layout->addWidget(new QLabel(T("Name (optional, defaults to folder name):")));
         m_nameEdit = new QLineEdit(initialName);
-        m_nameEdit->setPlaceholderText("e.g. Projects");
+        m_nameEdit->setPlaceholderText(T("e.g. Projects"));
         layout->addWidget(m_nameEdit);
 
         layout->addSpacing(8);
-        layout->addWidget(new QLabel("Directory:"));
+        layout->addWidget(new QLabel(T("Directory:")));
 
         auto* pathRow = new QHBoxLayout();
         m_pathEdit = new QLineEdit(initialPath);
         m_pathEdit->setPlaceholderText(QDir::homePath());
-        auto* browseBtn = new QPushButton("Browse...");
+        auto* browseBtn = new QPushButton(T("Browse..."));
         pathRow->addWidget(m_pathEdit, 1);
         pathRow->addWidget(browseBtn);
         layout->addLayout(pathRow);
@@ -55,7 +56,7 @@ public:
         connect(browseBtn, &QPushButton::clicked, this, [this]() {
             QString start = m_pathEdit->text().trimmed();
             if (start.isEmpty()) start = QDir::homePath();
-            QString dir = QFileDialog::getExistingDirectory(this, "Select directory", start);
+            QString dir = QFileDialog::getExistingDirectory(this, T("Select directory"), start);
             if (!dir.isEmpty()) m_pathEdit->setText(dir);
         });
 
@@ -95,8 +96,8 @@ ShortcutBar::ShortcutBar(QWidget* parent)
     // Header row: title + "add" button
     auto* headerRow = new QHBoxLayout();
     headerRow->setSpacing(4);
-    auto* title = new QLabel("SHORTCUTS");
-    title->setStyleSheet(
+    m_title = new QLabel(T("SHORTCUTS"));
+    m_title->setStyleSheet(
         "color: #81A1C1;"        // Nord9 pale blue
         "font-size: 10px;"
         "font-weight: bold;"
@@ -104,7 +105,7 @@ ShortcutBar::ShortcutBar(QWidget* parent)
 
     m_addBtn = new QPushButton("+");
     m_addBtn->setFixedSize(22, 22);
-    m_addBtn->setToolTip("Add shortcut");
+    m_addBtn->setToolTip(T("Add shortcut"));
     m_addBtn->setCursor(Qt::PointingHandCursor);
     m_addBtn->setFocusPolicy(Qt::NoFocus);
     m_addBtn->setFlat(true);
@@ -133,7 +134,7 @@ ShortcutBar::ShortcutBar(QWidget* parent)
         "  color: #ECEFF4;"
         "}");
 
-    headerRow->addWidget(title, 1);
+    headerRow->addWidget(m_title, 1);
     headerRow->addWidget(m_addBtn);
 
     rootLayout->addLayout(headerRow);
@@ -158,6 +159,13 @@ ShortcutBar::ShortcutBar(QWidget* parent)
     connect(m_addBtn, &QPushButton::clicked, this, &ShortcutBar::onAddClicked);
 
     loadFromSettings();
+
+    connect(&I18n::instance(), &I18n::changed, this, &ShortcutBar::retranslate);
+}
+
+void ShortcutBar::retranslate() {
+    if (m_title)  m_title->setText(T("SHORTCUTS"));
+    if (m_addBtn) m_addBtn->setToolTip(T("Add shortcut"));
 }
 
 QPushButton* ShortcutBar::makeShortcutButton(const ShortcutItem& item, int index) {
@@ -194,9 +202,9 @@ QPushButton* ShortcutBar::makeShortcutButton(const ShortcutItem& item, int index
     connect(btn, &QPushButton::customContextMenuRequested, this,
             [this, btn, index](const QPoint& pos) {
         QMenu menu(btn);
-        menu.addAction("Edit...", this, [this, index]() { editShortcut(index); });
+        menu.addAction(T("Edit..."), this, [this, index]() { editShortcut(index); });
         menu.addSeparator();
-        menu.addAction("Remove", this, [this, index]() { removeShortcut(index); });
+        menu.addAction(T("Remove"), this, [this, index]() { removeShortcut(index); });
         menu.exec(btn->mapToGlobal(pos));
     });
 
@@ -225,8 +233,10 @@ void ShortcutBar::addShortcut(const ShortcutItem& item) {
 
 void ShortcutBar::removeShortcut(int index) {
     if (index < 0 || index >= m_items.size()) return;
-    auto ans = QMessageBox::question(this, "Remove shortcut",
-        QString("Remove shortcut \"%1\"?").arg(m_items[index].name));
+    const bool zh = (I18n::instance().current() == I18n::Lang::Zh);
+    auto ans = QMessageBox::question(this, T("Remove shortcut"),
+        QString(zh ? "是否移除快捷栏目 \"%1\"？" : "Remove shortcut \"%1\"?")
+            .arg(m_items[index].name));
     if (ans != QMessageBox::Yes) return;
     m_items.removeAt(index);
     saveToSettings();
@@ -240,8 +250,8 @@ void ShortcutBar::editShortcut(int index) {
 
     QString path = dlg.path();
     if (path.isEmpty() || !QFileInfo(path).isDir()) {
-        QMessageBox::warning(this, "Invalid directory",
-            "Please choose an existing directory.");
+        QMessageBox::warning(this, T("Invalid directory"),
+            T("Please choose an existing directory."));
         return;
     }
     m_items[index].name = dlg.name();
@@ -256,8 +266,8 @@ void ShortcutBar::onAddClicked() {
 
     QString path = dlg.path();
     if (path.isEmpty() || !QFileInfo(path).isDir()) {
-        QMessageBox::warning(this, "Invalid directory",
-            "Please choose an existing directory.");
+        QMessageBox::warning(this, T("Invalid directory"),
+            T("Please choose an existing directory."));
         return;
     }
     ShortcutItem item{ dlg.name(), path };

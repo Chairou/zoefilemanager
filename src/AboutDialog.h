@@ -31,12 +31,16 @@ private slots:
     /// 把 Contents/Resources/licenses/<name> 的内容载到 m_licenseView。
     /// 找不到文件时显示一段提示文字，不抛异常。
     void showLicenseFile(const QString& fileName);
+    void retranslate();
 
 private:
     QString licensesDir() const;     // 计算 bundle 内 licenses/ 绝对路径
 
     QTextEdit* m_licenseView = nullptr;
     QLabel*    m_currentLabel = nullptr;
+    QLabel*    m_subLabel = nullptr;         // "Version X / Copyright..."
+    QLabel*    m_ackLabel = nullptr;         // LGPL 致谢大段 HTML
+    QString    m_currentLicenseFile;         // retranslate 时还原 "Showing: xxx"
 };
 
 #endif // ABOUTDIALOG_H

@@ -33,6 +33,7 @@ public:
 private slots:
     void onQuickCommandSelected(int index);  // 切换下拉项 → 自动填模板
     void onRunClicked();                     // 替换 {file} 占位符 + QProcess 执行
+    void retranslate();
 
 private:
     void setupQuickCommands();   // 内置一组常用命令
@@ -42,6 +43,12 @@ private:
     QLineEdit* m_commandInput;
     QTextEdit* m_outputArea;
     QPushButton* m_runBtn;
+    QPushButton* m_closeBtn = nullptr;
+    QLabel* m_warningLabel = nullptr;
+    QLabel* m_quickLabel = nullptr;
+    class QGroupBox* m_filesGroup = nullptr;
+    class QGroupBox* m_cmdGroup = nullptr;
+    class QGroupBox* m_outputGroup = nullptr;
     QVector<FileEntry> m_selectedFiles;
     QStringList m_commands;     // 与 m_quickCommands 索引一一对应的命令模板
 };

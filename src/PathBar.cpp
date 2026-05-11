@@ -7,6 +7,7 @@
 
 #include "PathBar.h"
 #include "FileSystemRouter.h"
+#include "I18n.h"
 #include <QLabel>
 #include <QApplication>
 #include <QClipboard>
@@ -47,7 +48,7 @@ PathBar::PathBar(QWidget* parent)
     editLayout->setContentsMargins(4, 0, 4, 0);
     editLayout->setSpacing(2);
     m_pathEdit = new QLineEdit();
-    m_pathEdit->setPlaceholderText("Enter path and press Enter (Esc to cancel)");
+    m_pathEdit->setPlaceholderText(T("Enter path and press Enter (Esc to cancel)"));
     m_pathEdit->setFixedHeight(20);
     m_pathEdit->setStyleSheet(
         "QLineEdit { padding: 0 4px; margin: 0; border: 1px solid #434C5E;"
@@ -266,7 +267,7 @@ void PathBar::rebuildButtons() {
 
     // Trailing "edit" button — click to switch to text-input mode
     m_editBtn = new QPushButton(QString::fromUtf8("\xE2\x9C\x8E"));  // ✎
-    m_editBtn->setToolTip("Edit path (double-click empty area, or Ctrl+L)");
+    m_editBtn->setToolTip(T("Edit path (double-click empty area, or Ctrl+L)"));
     m_editBtn->setFlat(true);
     m_editBtn->setCursor(Qt::PointingHandCursor);
     m_editBtn->setFocusPolicy(Qt::NoFocus);
@@ -318,8 +319,7 @@ void PathBar::showCopiedToast(const QPoint& globalPos) {
 
         auto* layout = new QHBoxLayout(m_toast);
         layout->setContentsMargins(0, 0, 0, 0);
-        auto* label = new QLabel(QString::fromUtf8("\xE2\x9C\x93 \xE8\xB7\xAF\xE5\xBE\x84\xE5\xB7\xB2\xE5\xA4\x8D\xE5\x88\xB6"), m_toast);
-        // UTF-8 "✓ 路径已复制"
+        auto* label = new QLabel(T("✓ Path copied"), m_toast);
         label->setObjectName("toastLabel");
         layout->addWidget(label);
 

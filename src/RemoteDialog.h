@@ -19,6 +19,7 @@
 // =============================================================================
 
 #include "Types.h"
+#include "I18n.h"
 #include <QDialog>
 #include <QLineEdit>
 #include <QSpinBox>
@@ -26,6 +27,8 @@
 #include <QListWidget>
 #include <QPushButton>
 #include <QLabel>
+#include <QGroupBox>
+#include <QFormLayout>
 #include <QVector>
 #include <memory>
 
@@ -53,6 +56,7 @@ private slots:
     void onSavedConnectionClicked(QListWidgetItem* item);  // 点已保存条目 → 填表
     void onConnectClicked();                                // 校验 + 真实拨号
     void onBrowseKey();                                     // 弹文件选择器选私钥
+    void retranslate();                                     // 语言切换时刷新所有可见文本
 
 private:
     void setupSavedConnections();   // 内置几条示例（不含密码）
@@ -63,6 +67,9 @@ private:
     void setBusy(bool busy);
 
     // ---- 控件 ----
+    QGroupBox*   m_savedGroup;
+    QGroupBox*   m_formGroup;
+    QFormLayout* m_formLayout;
     QListWidget* m_savedList;
     QComboBox*   m_protocolCombo;
     QLineEdit*   m_hostInput;
@@ -75,6 +82,7 @@ private:
     QPushButton* m_connectBtn;
     QPushButton* m_cancelBtn;
     QLabel*      m_statusLabel;          // 显示进度/错误/指纹
+    bool         m_statusIsReady = true; // Ready. 占位状态，retranslate 时重刷
 
     QVector<RemoteConnection> m_savedConnections;     // 内置示例
     RemoteConnection          m_lastConnected;        // 登录成功的那次

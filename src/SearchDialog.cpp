@@ -4,6 +4,7 @@
 
 #include "SearchDialog.h"
 #include "RealFileSystem.h"
+#include "I18n.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFormLayout>
@@ -11,7 +12,6 @@
 SearchDialog::SearchDialog(const QString& currentPath, QWidget* parent)
     : QDialog(parent)
 {
-    setWindowTitle("Search Files");
     setMinimumSize(500, 400);
 
     auto* layout = new QVBoxLayout(this);
@@ -19,22 +19,23 @@ SearchDialog::SearchDialog(const QString& currentPath, QWidget* parent)
     auto* formLayout = new QFormLayout();
 
     m_queryInput = new QLineEdit();
-    m_queryInput->setPlaceholderText("Enter search term...");
-    formLayout->addRow("Search:", m_queryInput);
+    m_searchLabel = new QLabel();
+    formLayout->addRow(m_searchLabel, m_queryInput);
 
     m_pathInput = new QLineEdit(currentPath);
-    formLayout->addRow("In path:", m_pathInput);
+    m_pathLabel = new QLabel();
+    formLayout->addRow(m_pathLabel, m_pathInput);
 
     layout->addLayout(formLayout);
 
     auto* btnLayout = new QHBoxLayout();
-    m_searchBtn = new QPushButton("Search");
+    m_searchBtn = new QPushButton();
     m_searchBtn->setDefault(true);
     btnLayout->addStretch();
     btnLayout->addWidget(m_searchBtn);
     layout->addLayout(btnLayout);
 
-    m_statusLabel = new QLabel("Enter a search term and click Search");
+    m_statusLabel = new QLabel();
     layout->addWidget(m_statusLabel);
 
     m_resultsList = new QListWidget();
@@ -43,6 +44,9 @@ SearchDialog::SearchDialog(const QString& currentPath, QWidget* parent)
     connect(m_searchBtn, &QPushButton::clicked, this, &SearchDialog::performSearch);
     connect(m_queryInput, &QLineEdit::returnPressed, this, &SearchDialog::performSearch);
     connect(m_resultsList, &QListWidget::itemDoubleClicked, this, &SearchDialog::onResultDoubleClicked);
+
+    connect(&I18n::instance(), &I18n::changed, this, &SearchDialog::retranslate);
+    retranslate();
 
     m_queryInput->setFocus();
 }
@@ -64,11 +68,29 @@ void SearchDialog::performSearch() {
         m_resultsList->addItem(item);
     }
 
-    m_statusLabel->setText(QString("Found %1 result(s)").arg(results.size()));
+    m_lastResultCount = static_cast<int>(results.size());
+    const bool zh = (I18n::instance().current() == I18n::Lang::Zh);
+    m_statusLabel->setText(
+        QString(zh ? "找到 %1 个结果" : "Found %1 result(s)").arg(m_lastResultCount));
 }
 
 void SearchDialog::onResultDoubleClicked(QListWidgetItem* item) {
     QString path = item->data(Qt::UserRole).toString();
     emit navigateToPath(path);
     accept();
+}
+
+void SearchDialog::retranslate() {
+    setWindowTitle(T("Search Files"));
+    m_queryInput->setPlaceholderText(T("Enter search term..."));
+    if (m_searchLabel) m_searchLabel->setText(T("Search:"));
+    if (m_pathLabel)   m_pathLabel->setText(T("In path:"));
+    m_searchBtn->setText(T("Search"));
+    if (m_lastResultCount < 0) {
+        m_statusLabel->setText(T("Enter a search term and click Search"));
+    } else {
+        const bool zh = (I18n::instance().current() == I18n::Lang::Zh);
+        m_statusLabel->setText(
+            QString(zh ? "找到 %1 个结果" : "Found %1 result(s)").arg(m_lastResultCount));
+    }
 }

@@ -18,64 +18,58 @@
 RemoteDialog::RemoteDialog(QWidget* parent)
     : QDialog(parent)
 {
-    setWindowTitle("Remote Connection");
     setMinimumSize(560, 540);
 
     auto* layout = new QVBoxLayout(this);
 
     // ---- Saved connections ----
-    auto* savedGroup  = new QGroupBox("Saved Connections");
-    auto* savedLayout = new QVBoxLayout(savedGroup);
+    m_savedGroup      = new QGroupBox();
+    auto* savedLayout = new QVBoxLayout(m_savedGroup);
     m_savedList = new QListWidget();
     m_savedList->setMaximumHeight(120);
     savedLayout->addWidget(m_savedList);
-    layout->addWidget(savedGroup);
+    layout->addWidget(m_savedGroup);
 
     setupSavedConnections();
 
     // ---- Connection form ----
-    auto* formGroup  = new QGroupBox("Connection Details");
-    auto* formLayout = new QFormLayout(formGroup);
+    m_formGroup  = new QGroupBox();
+    m_formLayout = new QFormLayout(m_formGroup);
 
     m_protocolCombo = new QComboBox();
     m_protocolCombo->addItems({"SFTP", "SSH"});  // SFTP first - it's the data path
-    formLayout->addRow("Protocol:", m_protocolCombo);
+    m_formLayout->addRow(QString(), m_protocolCombo);
 
     m_hostInput = new QLineEdit();
-    m_hostInput->setPlaceholderText("hostname or IP");
-    formLayout->addRow("Host:", m_hostInput);
+    m_formLayout->addRow(QString(), m_hostInput);
 
     m_portSpin = new QSpinBox();
     m_portSpin->setRange(1, 65535);
     m_portSpin->setValue(22);
-    formLayout->addRow("Port:", m_portSpin);
+    m_formLayout->addRow(QString(), m_portSpin);
 
     m_usernameInput = new QLineEdit();
-    m_usernameInput->setPlaceholderText("username");
-    formLayout->addRow("Username:", m_usernameInput);
+    m_formLayout->addRow(QString(), m_usernameInput);
 
     m_passwordInput = new QLineEdit();
     m_passwordInput->setEchoMode(QLineEdit::Password);
-    m_passwordInput->setPlaceholderText("leave empty if using a private key");
-    formLayout->addRow("Password:", m_passwordInput);
+    m_formLayout->addRow(QString(), m_passwordInput);
 
     auto* keyRow      = new QHBoxLayout();
     m_keyPathInput    = new QLineEdit();
-    m_keyPathInput->setPlaceholderText("optional, e.g. ~/.ssh/id_rsa");
-    m_browseKeyBtn    = new QPushButton("Browse…");
+    m_browseKeyBtn    = new QPushButton();
     keyRow->addWidget(m_keyPathInput);
     keyRow->addWidget(m_browseKeyBtn);
-    formLayout->addRow("Private key:", keyRow);
+    m_formLayout->addRow(QString(), keyRow);
 
     m_passphraseInput = new QLineEdit();
     m_passphraseInput->setEchoMode(QLineEdit::Password);
-    m_passphraseInput->setPlaceholderText("only if the key is encrypted");
-    formLayout->addRow("Key passphrase:", m_passphraseInput);
+    m_formLayout->addRow(QString(), m_passphraseInput);
 
-    layout->addWidget(formGroup);
+    layout->addWidget(m_formGroup);
 
     // ---- Status line ----
-    m_statusLabel = new QLabel("Ready.");
+    m_statusLabel = new QLabel();
     m_statusLabel->setWordWrap(true);
     m_statusLabel->setStyleSheet("color: #888;");
     layout->addWidget(m_statusLabel);
@@ -83,8 +77,8 @@ RemoteDialog::RemoteDialog(QWidget* parent)
     // ---- Buttons ----
     auto* btnLayout = new QHBoxLayout();
     btnLayout->addStretch();
-    m_cancelBtn = new QPushButton("Cancel");
-    m_connectBtn = new QPushButton("Connect");
+    m_cancelBtn = new QPushButton();
+    m_connectBtn = new QPushButton();
     m_connectBtn->setDefault(true);
     btnLayout->addWidget(m_cancelBtn);
     btnLayout->addWidget(m_connectBtn);
@@ -95,6 +89,9 @@ RemoteDialog::RemoteDialog(QWidget* parent)
     connect(m_connectBtn,  &QPushButton::clicked,            this, &RemoteDialog::onConnectClicked);
     connect(m_cancelBtn,   &QPushButton::clicked,            this, &QDialog::reject);
     connect(m_browseKeyBtn,&QPushButton::clicked,            this, &RemoteDialog::onBrowseKey);
+
+    connect(&I18n::instance(), &I18n::changed, this, &RemoteDialog::retranslate);
+    retranslate();
 }
 
 RemoteDialog::~RemoteDialog() {
@@ -146,8 +143,48 @@ void RemoteDialog::onSavedConnectionClicked(QListWidgetItem* item) {
 void RemoteDialog::onBrowseKey() {
     QString start = QDir::homePath() + "/.ssh";
     if (!QDir(start).exists()) start = QDir::homePath();
-    QString path = QFileDialog::getOpenFileName(this, "Select private key", start);
+    QString path = QFileDialog::getOpenFileName(this, T("Select private key"), start);
     if (!path.isEmpty()) m_keyPathInput->setText(path);
+}
+
+void RemoteDialog::retranslate() {
+    setWindowTitle(T("Remote Connection"));
+    m_savedGroup->setTitle(T("Saved Connections"));
+    m_formGroup->setTitle(T("Connection Details"));
+
+    // FormLayout 行标签：通过 labelForField 拿到 QLabel*，重新 setText
+    auto setFormLabel = [this](QWidget* field, const QString& text) {
+        if (auto* w = m_formLayout->labelForField(field)) {
+            if (auto* lbl = qobject_cast<QLabel*>(w)) lbl->setText(text);
+        }
+    };
+    setFormLabel(m_protocolCombo,   T("Protocol:"));
+    setFormLabel(m_hostInput,       T("Host:"));
+    setFormLabel(m_portSpin,        T("Port:"));
+    setFormLabel(m_usernameInput,   T("Username:"));
+    setFormLabel(m_passwordInput,   T("Password:"));
+    setFormLabel(m_passphraseInput, T("Key passphrase:"));
+    // keyRow 是 QHBoxLayout：通过其中一个子控件的 parentLayout 不好定位，
+    // 索性按行号取（Private key 那行是第 6 行，index=5）
+    if (auto* w = m_formLayout->itemAt(5, QFormLayout::LabelRole)) {
+        if (auto* lbl = qobject_cast<QLabel*>(w->widget())) {
+            lbl->setText(T("Private key:"));
+        }
+    }
+
+    m_hostInput->setPlaceholderText(T("hostname or IP"));
+    m_usernameInput->setPlaceholderText(T("username"));
+    m_passwordInput->setPlaceholderText(T("leave empty if using a private key"));
+    m_keyPathInput->setPlaceholderText(T("optional, e.g. ~/.ssh/id_rsa"));
+    m_passphraseInput->setPlaceholderText(T("only if the key is encrypted"));
+
+    m_browseKeyBtn->setText(T("Browse…"));
+    m_cancelBtn->setText(T("Cancel"));
+    m_connectBtn->setText(T("Connect"));
+
+    if (m_statusIsReady) {
+        m_statusLabel->setText(T("Ready."));
+    }
 }
 
 void RemoteDialog::setBusy(bool busy) {
@@ -193,22 +230,23 @@ void RemoteDialog::onConnectClicked() {
     }
 
     if (conn.host.isEmpty()) {
-        QMessageBox::warning(this, "Missing host", "Please enter a host name or IP.");
+        QMessageBox::warning(this, T("Missing host"), T("Please enter a host name or IP."));
         m_hostInput->setFocus(); return;
     }
     if (conn.username.isEmpty()) {
-        QMessageBox::warning(this, "Missing user", "Please enter a username.");
+        QMessageBox::warning(this, T("Missing user"), T("Please enter a username."));
         m_usernameInput->setFocus(); return;
     }
     if (conn.password.isEmpty() && conn.privateKeyPath.isEmpty()) {
-        QMessageBox::warning(this, "Missing credentials",
-            "Provide a password, a private key, or both.");
+        QMessageBox::warning(this, T("Missing credentials"),
+            T("Provide a password, a private key, or both."));
         m_passwordInput->setFocus(); return;
     }
 
     setBusy(true);
+    m_statusIsReady = false;
     m_statusLabel->setStyleSheet("color: #888;");
-    m_statusLabel->setText(QString("Connecting to %1@%2:%3 …")
+    m_statusLabel->setText(T("Connecting to %1@%2:%3 …")
         .arg(conn.username, conn.host).arg(conn.port));
     QApplication::processEvents();
 
@@ -219,7 +257,7 @@ void RemoteDialog::onConnectClicked() {
     if (!ok) {
         m_statusLabel->setStyleSheet("color: #c0392b;");
         m_statusLabel->setText("✗ " + client->lastError());
-        QMessageBox::critical(this, "Connection failed", client->lastError());
+        QMessageBox::critical(this, T("Connection failed"), client->lastError());
         return;
     }
 
@@ -231,8 +269,8 @@ void RemoteDialog::onConnectClicked() {
     m_client = std::move(client);
 
     m_statusLabel->setStyleSheet("color: #27ae60;");
-    m_statusLabel->setText(QString("✓ Connected. Host key %1")
-        .arg(conn.fingerprint.isEmpty() ? "(unknown)" : conn.fingerprint));
+    m_statusLabel->setText(T("✓ Connected. Host key %1")
+        .arg(conn.fingerprint.isEmpty() ? T("(unknown)") : conn.fingerprint));
 
     emit connectRequested(conn);
     accept();

@@ -36,6 +36,9 @@ set(SOURCES
     src/SftpClient.cpp
     src/FileSystemRouter.cpp
     src/AboutDialog.cpp
+    src/SettingsDialog.cpp
+    src/I18n.cpp
+    src/AppFonts.cpp
 )
 
 set(HEADERS
@@ -52,6 +55,9 @@ set(HEADERS
     src/SftpClient.h
     src/FileSystemRouter.h
     src/AboutDialog.h
+    src/SettingsDialog.h
+    src/I18n.h
+    src/AppFonts.h
     src/Types.h
 )
 

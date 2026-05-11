@@ -62,6 +62,7 @@ private slots:
     void onCellDoubleClicked(int row, int column);
     void onCustomContextMenu(const QPoint& pos);
     void onHeaderClicked(int logicalIndex);   // 表头点击 → 切换排序
+    void retranslate();   // 语言切换时刷新表头文字
 
 private:
     // 4 列的逻辑下标
