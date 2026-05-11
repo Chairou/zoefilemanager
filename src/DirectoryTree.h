@@ -35,6 +35,10 @@ public:
     void clearHighlight(PanelSide side);
     void expandToPath(const QString& path);   // 把所有祖先节点展开（懒加载触发）
 
+    /// 面板激活时调用：展开到 path 对应项、滚动到视图中心、setCurrentItem。
+    /// 远程/不在树中的路径静默跳过。不会触发 directorySelected 信号。
+    void revealPath(const QString& path);
+
 signals:
     void directorySelected(const QString& path);
 

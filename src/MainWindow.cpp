@@ -30,6 +30,10 @@
 #include <QDesktopServices>
 #include <QUrl>
 #include <QEventLoop>
+#include <QSettings>
+#include <QCloseEvent>
+#include <QInputDialog>
+#include <QRegularExpression>
 
 // ---------------------------------------------------------------------------
 // 构造：组装整个 UI 树。顺序大致是：
@@ -128,12 +132,127 @@ MainWindow::MainWindow(QWidget* parent)
     connect(qApp, &QCoreApplication::aboutToQuit, this, []() {
         FileSystemRouter::instance().clear();
     });
+
+    // 最后一步：从 QSettings 恢复用户上次关闭时的窗口几何、splitter 布局、
+    // 左右面板路径以及活跃面板。必须放在所有子组件构造、信号连接、初始
+    // navigateTo 完成之后；这样 loadSettings 里的 navigateTo / 高亮才能
+    // 正确触达 panel 与 directory tree。
+    loadSettings();
 }
 
 MainWindow::~MainWindow() {
     // 双保险：除了 aboutToQuit 之外再清一次。覆盖异常退出 / 提前关闭主窗口
     // 等绕过 aboutToQuit 的路径。clear() 是幂等的。
     FileSystemRouter::instance().clear();
+}
+
+// ---------------------------------------------------------------------------
+// 持久化：把左右面板的当前路径、活跃面板、splitter 布局以及窗口几何
+// 写入 QSettings，下次启动时通过 loadSettings 恢复。
+//
+// 存储位置（QSettings("WorkBuddy", "ZoeFileManager")）：
+//   - panels/leftPath        左面板当前路径（绝对本地路径）
+//   - panels/rightPath       右面板当前路径
+//   - panels/activeSide      "Left" / "Right"
+//   - mainSplitter/state     QSplitter::saveState() 的 byte array
+//   - window/geometry        QWidget::saveGeometry() 的 byte array
+//
+// 路径有效性策略（loadSettings）：
+//   - 远程 scheme（sftp://、ftp://）→ 回退到 home。本构建不持久化远程会话，
+//     启动时也无法重建 SFTP 挂载，强行 navigate 会失败/卡死。
+//   - 路径不存在或不是目录 → 回退到 home。
+// ---------------------------------------------------------------------------
+
+namespace {
+// 判断字符串是否以远程 scheme 开头。本构建只识别 sftp/ftp，
+// 但提前把 ssh/http(s) 也挡掉，省得未来加新协议时漏判。
+bool isRemoteScheme(const QString& path) {
+    static const char* const kSchemes[] = {
+        "sftp://", "ftp://", "ftps://", "ssh://",
+        "http://", "https://", "smb://"
+    };
+    for (const char* s : kSchemes) {
+        if (path.startsWith(QLatin1String(s), Qt::CaseInsensitive)) return true;
+    }
+    return false;
+}
+
+// 把候选路径校验为"本地存在的目录"；不合格回退到 home。
+QString sanitizeLocalDir(const QString& candidate) {
+    if (candidate.isEmpty()) return QDir::homePath();
+    if (isRemoteScheme(candidate)) return QDir::homePath();
+    QFileInfo fi(candidate);
+    if (!fi.exists() || !fi.isDir()) return QDir::homePath();
+    return fi.absoluteFilePath();
+}
+} // namespace
+
+void MainWindow::loadSettings() {
+    QSettings settings("WorkBuddy", "ZoeFileManager");
+
+    // ---- 窗口几何 / splitter 布局 ----
+    // restoreGeometry / restoreState 在数据缺失或不兼容时返回 false，
+    // 我们不做特殊处理，构造函数里已经 resize(1400, 800) + setSizes(...)
+    // 提供了合理默认值。
+    const QByteArray geom = settings.value("window/geometry").toByteArray();
+    if (!geom.isEmpty()) restoreGeometry(geom);
+
+    const QByteArray splitterState = settings.value("mainSplitter/state").toByteArray();
+    if (!splitterState.isEmpty()) m_mainSplitter->restoreState(splitterState);
+
+    // ---- 左右面板路径 ----
+    const QString defaultPath = QDir::homePath();
+    const QString leftRaw  = settings.value("panels/leftPath",  defaultPath).toString();
+    const QString rightRaw = settings.value("panels/rightPath", defaultPath).toString();
+
+    const QString leftPath  = sanitizeLocalDir(leftRaw);
+    const QString rightPath = sanitizeLocalDir(rightRaw);
+
+    m_leftPanel->navigateTo(leftPath);
+    m_rightPanel->navigateTo(rightPath);
+
+    // 同步左侧目录树高亮，对齐构造函数里的 "Initial highlights" 行为
+    m_dirTree->highlightPath(leftPath,  PanelSide::Left);
+    m_dirTree->highlightPath(rightPath, PanelSide::Right);
+
+    // ---- 活跃面板 ----
+    const QString activeStr = settings.value("panels/activeSide", "Left").toString();
+    if (activeStr == QLatin1String("Right")) {
+        m_activePane = PanelSide::Right;
+        m_rightPanel->setFocus();
+    } else {
+        m_activePane = PanelSide::Left;
+        m_leftPanel->setFocus();
+    }
+
+    updateStatusBar();
+}
+
+void MainWindow::saveSettings() {
+    QSettings settings("WorkBuddy", "ZoeFileManager");
+
+    // 面板当前路径：直接读取 FilePanel::currentPath()。注意这里不过滤
+    // 远程路径——存了也无害（loadSettings 会回退到 home），而保留路径文本
+    // 对调试有帮助。但为了下次启动恢复行为可预测，我们对远程路径明确改写
+    // 为 home，避免把 sftp:// 写进配置。
+    auto sanitizeForSave = [](const QString& p) -> QString {
+        if (p.isEmpty() || isRemoteScheme(p)) return QDir::homePath();
+        return p;
+    };
+    settings.setValue("panels/leftPath",  sanitizeForSave(m_leftPanel->currentPath()));
+    settings.setValue("panels/rightPath", sanitizeForSave(m_rightPanel->currentPath()));
+    settings.setValue("panels/activeSide",
+        m_activePane == PanelSide::Left ? QStringLiteral("Left")
+                                        : QStringLiteral("Right"));
+
+    settings.setValue("mainSplitter/state", m_mainSplitter->saveState());
+    settings.setValue("window/geometry",    saveGeometry());
+}
+
+// 关闭事件：先把状态落盘再走父类默认处理（接受关闭 → 进入 aboutToQuit）。
+void MainWindow::closeEvent(QCloseEvent* event) {
+    saveSettings();
+    QMainWindow::closeEvent(event);
 }
 
 // 工具栏：每个 action 都直接绑到对应槽，文本前缀的 Unicode 是图标占位。
@@ -1024,11 +1143,32 @@ void MainWindow::onPanelSelectionChanged(PanelSide /*side*/) {
 void MainWindow::onPanelActivated(PanelSide side) {
     m_activePane = side;
     updateStatusBar();
+    // 让左侧目录树跟随激活面板：展开+滚动+选中对应目录项。
+    // revealPath 对远程/未在树中的路径静默跳过，且内部阻断信号，
+    // 不会回调 directorySelected -> navigateTo，避免重入。
+    if (m_dirTree) {
+        m_dirTree->revealPath(activePanel()->currentPath());
+    }
 }
 
-// 左侧目录树点击：导航 active panel 过去
+// 左侧目录树点击：导航 active panel 过去，并把目录树自身滚动到该项
+// 让"双向联动"可见：点树 → active 面板跳转 + 两侧树高亮均由 pathChanged 回调更新。
 void MainWindow::onDirectoryTreeSelected(const QString& path) {
+    if (path.isEmpty()) return;
+    // 让 active 面板跳转。FilePanel::navigateTo 会 emit pathChanged，
+    // 继而 onPanelPathChanged 调用 highlightPath + expandToPath 同步树。
     activePanel()->navigateTo(path);
+    // 显式把树滚动到被点项中心 + 聚焦高亮——确保视觉反馈明确（防止
+    // 用户误以为"点了却没跳"：比如此前 active 面板和树上被点项完全同路径，
+    // 或树因 setCurrentItem 行为未把视图居中）。
+    if (m_dirTree) {
+        m_dirTree->revealPath(path);
+    }
+    // 同时刷新对侧的高亮状态（pathChanged 回调只改动 active 一侧）。
+    m_dirTree->highlightPath(activePanel()->currentPath(), m_activePane);
+    PanelSide other = (m_activePane == PanelSide::Left) ? PanelSide::Right : PanelSide::Left;
+    FilePanel* otherPanel = (other == PanelSide::Left) ? m_leftPanel : m_rightPanel;
+    m_dirTree->highlightPath(otherPanel->currentPath(), other);
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,6 +1327,23 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
         menu.addSeparator();
     }
 
+    // ---- "New File" / "New Folder" 顶端项 ----
+    // 在当前 active panel 的 cwd 下创建文件/目录。远程路径走 information 弹窗
+    // （由槽自身处理，这里直接把 cwd / isRemote 透传过去——避免 lambda 捕获
+    // 时再算一次）。
+    {
+        const QString cwd = activePanel()->currentPath();
+        const bool isRemote = FileSystemRouter::instance().isRemote(cwd);
+
+        menu.addAction("New File…", this, [this, cwd, isRemote]() {
+            onCreateNewFile(cwd, isRemote);
+        });
+        menu.addAction("New Folder…", this, [this, cwd, isRemote]() {
+            onCreateNewFolder(cwd, isRemote);
+        });
+        menu.addSeparator();
+    }
+
     // NOTE: "\tCtrl+X" in Qt QAction text is auto-translated to "⌘X" display
     // on macOS. The actual QShortcut bindings are registered in setupShortcuts()
     // using Qt::CTRL | Qt::Key_X (which maps to Cmd on macOS, Ctrl elsewhere).
@@ -1228,6 +1385,128 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
     menu.addAction("Run Script\tCtrl+E", this, &MainWindow::onRunScript);
 
     menu.exec(pos);
+}
+
+// ---------------------------------------------------------------------------
+// 新建文件 / 新建目录（右键菜单触发）
+//
+// 共同流程：
+//   1. 远程目录直接拒绝（router 不支持远程写）
+//   2. QInputDialog 取名，trim 后校验非法字符 (/ \ : * ? " < > |)
+//   3. 已存在则自动追加 " (2)" / " (3)" …，文件保留扩展名
+//   4. 实际创建（QFile::open / QDir::mkdir），失败弹 warning
+//   5. 成功后 refresh() active panel + 状态栏 2s 提示
+//
+// 这里没有走 FileSystemRouter——目标本来就是本地路径（远程已被前置 return），
+// 直接用 Qt 自己的 API 最直观；也避免给 router 增加不必要的接口。
+// ---------------------------------------------------------------------------
+
+namespace {
+// 文件名非法字符（含 Windows + Unix 常见保留符）。前导 / 末尾空白由 trim 处理。
+bool hasInvalidNameChars(const QString& name) {
+    static const QRegularExpression kBad(R"([\\/:\*\?"<>\|])");
+    return kBad.match(name).hasMatch();
+}
+
+// 解析 "foo.tar.gz" → ("foo", ".tar.gz")？不，QFileInfo 的 completeSuffix 太贪婪。
+// 这里采用 Finder 风格：只剥离最后一个 "." 起的扩展名（"foo.tar.gz" → "foo.tar" + ".gz"）。
+// 没有点的名字（包括纯隐藏文件如 ".env"）整体当作 base、扩展名为空。
+QPair<QString, QString> splitBaseAndExt(const QString& fileName) {
+    const int dot = fileName.lastIndexOf('.');
+    if (dot <= 0 || dot == fileName.size() - 1) {
+        // 没扩展名 / 以点开头（隐藏文件）/ 以点结尾——都不剥
+        return { fileName, QString() };
+    }
+    return { fileName.left(dot), fileName.mid(dot) };
+}
+
+// 在 dir 下为 desired 找一个不冲突的名字；冲突则追加 " (2)" / " (3)" …
+// isFile=true 时保留扩展名（"foo.txt" → "foo (2).txt"），否则整体追加。
+QString uniqueName(const QString& dir, const QString& desired, bool isFile) {
+    QDir d(dir);
+    if (!QFileInfo::exists(d.filePath(desired))) return desired;
+
+    QString base, ext;
+    if (isFile) {
+        auto pair = splitBaseAndExt(desired);
+        base = pair.first;
+        ext  = pair.second;
+    } else {
+        base = desired;
+    }
+
+    for (int i = 2; i < 10000; ++i) {
+        const QString candidate = QString("%1 (%2)%3").arg(base).arg(i).arg(ext);
+        if (!QFileInfo::exists(d.filePath(candidate))) return candidate;
+    }
+    // 极端兜底：返回原名让创建步骤自己失败，避免死循环
+    return desired;
+}
+} // namespace
+
+void MainWindow::onCreateNewFile(const QString& dir, bool isRemote) {
+    if (isRemote) {
+        QMessageBox::information(this, "Not Supported",
+            "Creating files/folders on remote paths is not supported yet.");
+        return;
+    }
+
+    bool ok = false;
+    QString name = QInputDialog::getText(this,
+        "New File", "Name:", QLineEdit::Normal,
+        "untitled.txt", &ok).trimmed();
+    if (!ok || name.isEmpty()) return;
+
+    if (hasInvalidNameChars(name)) {
+        QMessageBox::warning(this, "Invalid Name",
+            "Name contains invalid characters.");
+        return;
+    }
+
+    const QString finalName = uniqueName(dir, name, /*isFile=*/true);
+    const QString full = QDir(dir).filePath(finalName);
+
+    QFile f(full);
+    if (!f.open(QIODevice::WriteOnly)) {
+        QMessageBox::warning(this, "Create Failed",
+            QString("Cannot create file: %1").arg(f.errorString()));
+        return;
+    }
+    f.close();
+
+    activePanel()->refresh();
+    statusBar()->showMessage(QString("Created: %1").arg(finalName), 2000);
+}
+
+void MainWindow::onCreateNewFolder(const QString& dir, bool isRemote) {
+    if (isRemote) {
+        QMessageBox::information(this, "Not Supported",
+            "Creating files/folders on remote paths is not supported yet.");
+        return;
+    }
+
+    bool ok = false;
+    QString name = QInputDialog::getText(this,
+        "New Folder", "Name:", QLineEdit::Normal,
+        "untitled folder", &ok).trimmed();
+    if (!ok || name.isEmpty()) return;
+
+    if (hasInvalidNameChars(name)) {
+        QMessageBox::warning(this, "Invalid Name",
+            "Name contains invalid characters.");
+        return;
+    }
+
+    const QString finalName = uniqueName(dir, name, /*isFile=*/false);
+    const QString full = QDir(dir).filePath(finalName);
+
+    if (!QDir().mkdir(full)) {
+        QMessageBox::warning(this, "Create Failed", "Cannot create folder.");
+        return;
+    }
+
+    activePanel()->refresh();
+    statusBar()->showMessage(QString("Created: %1").arg(finalName), 2000);
 }
 
 // 重新计算状态栏四个 label 的内容（条目数 / 选中数 / 剪贴板 / 活跃面板）

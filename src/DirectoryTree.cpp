@@ -9,6 +9,8 @@
 #include "RealFileSystem.h"
 #include <QHeaderView>
 #include <QDir>
+#include <QSignalBlocker>
+#include <QAbstractItemView>
 
 DirectoryTree::DirectoryTree(QWidget* parent)
     : QTreeWidget(parent)
@@ -18,6 +20,21 @@ DirectoryTree::DirectoryTree(QWidget* parent)
     setIndentation(16);
     setExpandsOnDoubleClick(false);
     header()->setVisible(false);
+
+    // 滚动条：水平/垂直均 AsNeeded —— 视口放得下时隐藏，放不下时出现。
+    // macOS 原生样式下表现为 overlay（滚动时才浮现），符合"平时不显示"预期。
+    setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    // 按像素滚动比按 item 滚动更平滑，横向尤其明显。
+    setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+    setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    // 默认 QTreeWidget 在列宽不足时会裁剪文字（"...")而不触发水平滚动。
+    // 让 header 按内容尺寸伸展，使超长文件名真正把内容宽度撑大，
+    // 从而在需要时让横向滚动条可用。
+    header()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    header()->setStretchLastSection(false);
+    // 关闭文字省略，让完整文件名参与内容宽度计算。
+    setTextElideMode(Qt::ElideNone);
 
     // 200ms protection timer for click disambiguation
     m_clickTimer = new QTimer(this);
@@ -227,4 +244,26 @@ void DirectoryTree::expandToPath(const QString& path) {
             break;
         }
     }
+}
+
+// 展开到 path 对应项 + 滚动到视图中心 + setCurrentItem。
+// 用于面板激活时让左侧树跟随定位。
+// 用 QSignalBlocker 暂时阻断本树信号，防止 setCurrentItem 触发 itemClicked
+// 进而回调 navigateTo 形成重入。
+void DirectoryTree::revealPath(const QString& path) {
+    if (path.isEmpty()) return;
+    // 远程/非本地 scheme：本树仅管本地文件系统，直接跳过。
+    if (path.startsWith("sftp://") || path.startsWith("ftp://") ||
+        path.startsWith("ssh://")  || path.startsWith("smb://") ||
+        path.startsWith("http://") || path.startsWith("https://")) {
+        return;
+    }
+    expandToPath(path);
+    auto it = m_pathToItem.find(path);
+    if (it == m_pathToItem.end()) return;
+    QTreeWidgetItem* item = it.value();
+
+    QSignalBlocker blocker(this);
+    setCurrentItem(item);
+    scrollToItem(item, QAbstractItemView::PositionAtCenter);
 }

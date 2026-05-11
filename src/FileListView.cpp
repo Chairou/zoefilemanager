@@ -34,8 +34,21 @@ FileListView::FileListView(QWidget* parent)
     verticalHeader()->setVisible(false);
     verticalHeader()->setDefaultSectionSize(25);  // 28 - 10% → 25
     verticalHeader()->setMinimumSectionSize(20);
-    horizontalHeader()->setStretchLastSection(true);
+    // 关闭"最后一列拉满"，让总列宽是各列的实际设置宽之和；
+    // 这样当视口窄于总列宽时会触发水平滚动条，反之隐藏。
+    horizontalHeader()->setStretchLastSection(false);
     horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+
+    // 滚动条：AsNeeded —— 平时不显示，内容/列宽 > 视口时自动出现。
+    // macOS 下自动走系统 overlay 样式。
+    setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+    setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    // 关闭 Name 列的省略号，让长文件名真实撑大内容宽度；
+    // 这样横向滚动条才有意义可触发。
+    setTextElideMode(Qt::ElideNone);
+    setWordWrap(false);
 
     // We drive sorting ourselves (to keep . / .. / directory-first rules).
     // Don't enable QTableWidget's built-in sort — just use the header's

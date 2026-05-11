@@ -37,6 +37,7 @@
 #include <QStatusBar>
 #include <QAction>
 #include <QLabel>
+#include <QCloseEvent>
 #include <optional>
 
 class MainWindow : public QMainWindow {
@@ -45,6 +46,10 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
+
+protected:
+    // 拦截关闭事件以持久化窗口/面板状态（左右面板路径、活跃面板、splitter、几何）
+    void closeEvent(QCloseEvent* event) override;
 
 private slots:
     // ----- 工具栏动作 -----
@@ -68,6 +73,12 @@ private slots:
     void onRemoteDisconnect(); // 拆挂载，回到 home
     void onToggleTheme();      // 暗/亮主题切换
     void onToggleHidden();     // 显示/隐藏点文件
+
+    // ----- 右键菜单：新建文件 / 新建目录 -----
+    // dir 为目标目录（active panel 的 currentPath）；isRemote 为 router.isRemote(dir)。
+    // 远程暂不支持，弹 information 后 return。
+    void onCreateNewFile(const QString& dir, bool isRemote);
+    void onCreateNewFolder(const QString& dir, bool isRemote);
 
     // ----- 来自子组件的回调 -----
     void onPanelPathChanged(const QString& path, PanelSide side);
@@ -94,6 +105,10 @@ private:
     void applyLightTheme();
     void updateStatusBar();   // 重算左右面板条目数 / 剪贴板提示
     FilePanel* activePanel() const;   // m_activePane 翻译为对应指针
+
+    // ----- 持久化（QSettings: WorkBuddy / ZoeFileManager） -----
+    void loadSettings();      // 启动时读取并恢复左右面板路径、活跃面板、几何
+    void saveSettings();      // 关闭时写入当前左右面板路径、活跃面板、几何
 
     // ----- 子组件 -----
     QSplitter* m_mainSplitter;
