@@ -1,0 +1,51 @@
+Zoe File Manager — Third-Party Software Notices
+=================================================
+
+This product uses the following third-party open-source components.
+The full text of each license is included alongside this file under
+Contents/Resources/licenses/ inside the application bundle.
+
+----------------------------------------
+1. Qt 6 (LGPL v3)
+----------------------------------------
+Copyright (C) The Qt Company Ltd. and other contributors.
+
+Qt 6 is used in this product under the GNU Lesser General Public License,
+version 3 (LGPL-3.0). The Qt source code is available from:
+    https://download.qt.io/
+
+In accordance with the LGPL, this product:
+  - Dynamically links to the Qt libraries (QtCore, QtGui, QtWidgets, ...).
+  - Bundles the Qt frameworks under Contents/Frameworks/, which the user
+    may replace with a compatible build of Qt at the same major version.
+  - Does not modify Qt itself; should that ever change, those changes
+    will be made available under the LGPL.
+
+License text: see ./LGPL-3.0.txt
+
+----------------------------------------
+2. libssh2 (BSD-3-Clause-style)
+----------------------------------------
+Copyright (c) 2004-2024 The libssh2 contributors.
+Used under the libssh2 license (a BSD-3-Clause variant).
+
+License text: see ./libssh2.txt
+
+----------------------------------------
+3. OpenSSL (Apache-2.0; OpenSSL 3.x)
+----------------------------------------
+Copyright (c) 1998-2024 The OpenSSL Project Authors
+Copyright (c) 1995-1998 Eric A. Young, Tim J. Hudson
+All rights reserved.
+
+Used as a transitive dependency of libssh2 to provide cryptographic
+primitives. OpenSSL 3.x is licensed under the Apache License 2.0.
+
+License text: see ./OpenSSL.txt
+
+----------------------------------------
+Trademark Notice
+----------------------------------------
+"Qt" is a trademark of The Qt Company Ltd. The use of the name "Qt" in
+this notice is for attribution purposes only and does not imply any
+endorsement by The Qt Company.

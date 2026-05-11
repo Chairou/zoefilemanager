@@ -1,0 +1,1806 @@
+// =============================================================================
+// MainWindow.cpp —— 见 MainWindow.h
+//
+// 本文件相对长（>1000 行），按"装配 → 工具栏 → 槽函数 → 主题 → 状态栏"
+// 大致顺序排布。重点关注：
+//   - 构造函数：UI 装配与信号-槽接线，应用退出 hook（aboutToQuit → router.clear）
+//   - onPaste / onDropCopy / onDelete：进度对话框 + 远程边界守卫的样板
+//   - onRemoteConnect / onRemoteDisconnect：把 SFTP 会话交给 FileSystemRouter
+// =============================================================================
+
+#include "MainWindow.h"
+#include "SearchDialog.h"
+#include "RemoteDialog.h"
+#include "SftpClient.h"
+#include "FileSystemRouter.h"
+#include "ScriptDialog.h"
+#include "RealFileSystem.h"
+#include "AboutDialog.h"
+#include <QApplication>
+#include <QShortcut>
+#include <QMenu>
+#include <QMenuBar>
+#include <QMessageBox>
+#include <QClipboard>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QProgressDialog>
+#include <QProcess>
+#include <QDesktopServices>
+#include <QUrl>
+#include <QEventLoop>
+
+// ---------------------------------------------------------------------------
+// 构造：组装整个 UI 树。顺序大致是：
+//   1. 主分割器 + 左侧（DirectoryTree + ShortcutBar 上下叠放）+ 双面板
+//   2. 接线：path/选择/激活/右键/拖拽 等所有面板信号 → 本类的槽
+//   3. 工具栏 / 状态栏 / 快捷键 / 默认主题
+//   4. 注册 aboutToQuit hook —— 在 Qt 主循环退出时主动清掉所有 SFTP 会话，
+//      避免静态析构期 libssh2 撞到已卸载的 libcrypto（旧版崩溃 bug）
+// ---------------------------------------------------------------------------
+MainWindow::MainWindow(QWidget* parent)
+    : QMainWindow(parent)
+{
+    setWindowTitle("Zoe File Manager 0.8");
+    resize(1400, 800);
+
+    // Main splitter: Tree | Left Panel | Right Panel
+    m_mainSplitter = new QSplitter(Qt::Horizontal, this);
+    setCentralWidget(m_mainSplitter);
+
+    m_dirTree = new DirectoryTree();
+    m_shortcutBar = new ShortcutBar();
+
+    // Left sidebar: ShortcutBar on top, DirectoryTree below (vertical splitter)
+    auto* sidebarSplitter = new QSplitter(Qt::Vertical);
+    sidebarSplitter->addWidget(m_shortcutBar);
+    sidebarSplitter->addWidget(m_dirTree);
+    sidebarSplitter->setStretchFactor(0, 0);
+    sidebarSplitter->setStretchFactor(1, 1);
+    sidebarSplitter->setSizes({140, 600});
+    sidebarSplitter->setMinimumWidth(200);
+    sidebarSplitter->setMaximumWidth(380);
+
+    m_leftPanel = new FilePanel(PanelSide::Left);
+    m_rightPanel = new FilePanel(PanelSide::Right);
+
+    m_mainSplitter->addWidget(sidebarSplitter);
+    m_mainSplitter->addWidget(m_leftPanel);
+    m_mainSplitter->addWidget(m_rightPanel);
+    m_mainSplitter->setSizes({240, 550, 550});
+
+    setupToolbar();
+    setupStatusBar();
+    setupShortcuts();
+
+    // Connect panel signals
+    connect(m_leftPanel, &FilePanel::pathChanged, this, &MainWindow::onPanelPathChanged);
+    connect(m_rightPanel, &FilePanel::pathChanged, this, &MainWindow::onPanelPathChanged);
+    connect(m_leftPanel, &FilePanel::selectionChanged, this, &MainWindow::onPanelSelectionChanged);
+    connect(m_rightPanel, &FilePanel::selectionChanged, this, &MainWindow::onPanelSelectionChanged);
+    connect(m_leftPanel, &FilePanel::activated, this, &MainWindow::onPanelActivated);
+    connect(m_rightPanel, &FilePanel::activated, this, &MainWindow::onPanelActivated);
+    connect(m_leftPanel, &FilePanel::contextMenuRequested, this, &MainWindow::onContextMenu);
+    connect(m_rightPanel, &FilePanel::contextMenuRequested, this, &MainWindow::onContextMenu);
+    connect(m_leftPanel, &FilePanel::dropCopyRequested, this, &MainWindow::onDropCopy);
+    connect(m_rightPanel, &FilePanel::dropCopyRequested, this, &MainWindow::onDropCopy);
+    connect(m_leftPanel, &FilePanel::archiveActivated, this, &MainWindow::onExtractArchive);
+    connect(m_rightPanel, &FilePanel::archiveActivated, this, &MainWindow::onExtractArchive);
+
+    // Connect directory tree
+    connect(m_dirTree, &DirectoryTree::directorySelected, this, &MainWindow::onDirectoryTreeSelected);
+
+    // Connect shortcut bar — clicking a shortcut navigates the active panel
+    connect(m_shortcutBar, &ShortcutBar::shortcutActivated, this,
+            [this](const QString& path) {
+        activePanel()->navigateTo(path);
+    });
+
+    // Initial highlights
+    m_dirTree->highlightPath(m_leftPanel->currentPath(), PanelSide::Left);
+    m_dirTree->highlightPath(m_rightPanel->currentPath(), PanelSide::Right);
+
+    applyDarkTheme();
+    updateStatusBar();
+
+    // ---- 应用菜单栏：Help → About ----
+    // 在 macOS 下，About 项会被自动归并到应用菜单（Apple 菜单旁那个），
+    // 这是 Qt 平台集成的默认行为；Linux/Windows 上会留在 "Help" 菜单。
+    // 这一项满足 LGPLv3 的 "appropriate copyright notice" 义务。
+    {
+        QMenu* helpMenu = menuBar()->addMenu("Help");
+        QAction* about = helpMenu->addAction("About Zoe File Manager");
+        // Qt 默认把 ApplicationRole 的 action 移到 macOS 应用菜单下
+        about->setMenuRole(QAction::AboutRole);
+        connect(about, &QAction::triggered, this, [this]() {
+            AboutDialog dlg(this);
+            dlg.exec();
+        });
+    }
+
+    // Crucial: tear all SFTP / SSH sessions down while Qt, libssh2 and
+    // libcrypto are still fully alive. If we wait for static destructors
+    // at process exit, OpenSSL's RNG locks may have already been freed and
+    // libssh2_session_free / libssh2_sftp_shutdown crash inside
+    // pthread_rwlock_rdlock(NULL). aboutToQuit fires on the main thread
+    // right before QCoreApplication returns from exec().
+    connect(qApp, &QCoreApplication::aboutToQuit, this, []() {
+        FileSystemRouter::instance().clear();
+    });
+}
+
+MainWindow::~MainWindow() {
+    // 双保险：除了 aboutToQuit 之外再清一次。覆盖异常退出 / 提前关闭主窗口
+    // 等绕过 aboutToQuit 的路径。clear() 是幂等的。
+    FileSystemRouter::instance().clear();
+}
+
+// 工具栏：每个 action 都直接绑到对应槽，文本前缀的 Unicode 是图标占位。
+// 修改文本时注意保持 UTF-8 字节序列正确。
+void MainWindow::setupToolbar() {
+    auto* toolbar = addToolBar("Main");
+    toolbar->setMovable(false);
+    toolbar->setIconSize(QSize(20, 20));
+
+    m_backAction = toolbar->addAction("\xE2\x86\x90 Back", this, &MainWindow::onBack);
+    m_forwardAction = toolbar->addAction("\xE2\x86\x92 Fwd", this, &MainWindow::onForward);
+    m_upAction = toolbar->addAction("\xE2\x86\x91 Up", this, &MainWindow::onUp);
+    m_refreshAction = toolbar->addAction("\xE2\x9F\xB3 Refresh", this, &MainWindow::onRefresh);
+
+    toolbar->addSeparator();
+
+    m_copyAction = toolbar->addAction("Copy", this, &MainWindow::onCopy);
+    m_cutAction = toolbar->addAction("Cut", this, &MainWindow::onCut);
+    m_pasteAction = toolbar->addAction("Paste", this, &MainWindow::onPaste);
+    m_deleteAction = toolbar->addAction("Delete", this, &MainWindow::onDelete);
+
+    toolbar->addSeparator();
+
+    m_selectAllAction = toolbar->addAction("Select All", this, &MainWindow::onSelectAll);
+    m_copyPathAction = toolbar->addAction("Copy Path", this, &MainWindow::onCopyPath);
+    m_runScriptAction = toolbar->addAction("Script", this, &MainWindow::onRunScript);
+    m_searchAction = toolbar->addAction("Search", this, &MainWindow::onSearch);
+
+    toolbar->addSeparator();
+
+    m_remoteConnectAction = toolbar->addAction("Connect", this, &MainWindow::onRemoteConnect);
+    m_remoteDisconnectAction = toolbar->addAction("Disconnect", this, &MainWindow::onRemoteDisconnect);
+    m_remoteDisconnectAction->setEnabled(false);
+
+    toolbar->addSeparator();
+
+    m_hiddenAction = toolbar->addAction("\xE2\x97\x89 Hidden", this, &MainWindow::onToggleHidden);
+    m_hiddenAction->setCheckable(true);
+    m_hiddenAction->setChecked(RealFileSystem::instance().showHidden());
+    m_hiddenAction->setToolTip("Show/hide dot-files (files starting with '.')");
+
+    m_themeAction = toolbar->addAction("Theme: Dark", this, &MainWindow::onToggleTheme);
+}
+
+// 状态栏：四个 QLabel 平铺，分别显示左面板信息、右面板信息、剪贴板状态、活跃面板提示
+void MainWindow::setupStatusBar() {
+    m_statusLeft = new QLabel();
+    m_statusRight = new QLabel();
+    m_statusClipboard = new QLabel();
+    m_statusPanel = new QLabel();
+
+    statusBar()->addWidget(m_statusLeft, 1);
+    statusBar()->addWidget(m_statusRight, 1);
+    statusBar()->addWidget(m_statusClipboard, 1);
+    statusBar()->addPermanentWidget(m_statusPanel);
+}
+
+// 全局快捷键：Cmd+C / Cmd+X / Cmd+V / Cmd+A / Backspace / Cmd+L 等。
+// 注意：FileListView 主动 ignore 这些 keyEvent 让它们冒泡到这里，否则
+// QAbstractItemView 默认的 Cmd+C/A 行为会抢走。
+void MainWindow::setupShortcuts() {
+    // ---- Clipboard operations ----
+    // Qt's "Ctrl+X" is platform-translated to Cmd+X on macOS automatically,
+    // but we ALSO register the explicit Meta+ modifier (Qt::Key_Meta == Cmd
+    // on macOS) so the intent is obvious in the code and the shortcut keeps
+    // working even if Qt's auto-translation is ever disabled.
+    //
+    // macOS: Cmd+C / Cmd+X / Cmd+V  (Qt::CTRL is Cmd on Mac)
+    // Linux / Windows: Ctrl+C / Ctrl+X / Ctrl+V
+    auto* scCopy = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_C), this);
+    scCopy->setContext(Qt::WindowShortcut);
+    connect(scCopy, &QShortcut::activated, this, &MainWindow::onCopy);
+
+    auto* scCut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_X), this);
+    scCut->setContext(Qt::WindowShortcut);
+    connect(scCut, &QShortcut::activated, this, &MainWindow::onCut);
+
+    auto* scPaste = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_V), this);
+    scPaste->setContext(Qt::WindowShortcut);
+    connect(scPaste, &QShortcut::activated, this, &MainWindow::onPaste);
+
+    auto* scSelectAll = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_A), this);
+    scSelectAll->setContext(Qt::WindowShortcut);
+    connect(scSelectAll, &QShortcut::activated, this, &MainWindow::onSelectAll);
+
+    auto* scDelete = new QShortcut(QKeySequence::Delete, this);
+    connect(scDelete, &QShortcut::activated, this, &MainWindow::onDelete);
+
+    auto* scBack = new QShortcut(QKeySequence("Alt+Left"), this);
+    connect(scBack, &QShortcut::activated, this, &MainWindow::onBack);
+
+    auto* scForward = new QShortcut(QKeySequence("Alt+Right"), this);
+    connect(scForward, &QShortcut::activated, this, &MainWindow::onForward);
+
+    auto* scUp = new QShortcut(QKeySequence("Alt+Up"), this);
+    connect(scUp, &QShortcut::activated, this, &MainWindow::onUp);
+
+    auto* scSearch = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_F), this);
+    connect(scSearch, &QShortcut::activated, this, &MainWindow::onSearch);
+
+    auto* scScript = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_E), this);
+    connect(scScript, &QShortcut::activated, this, &MainWindow::onRunScript);
+
+    // Ctrl+L / Cmd+L — focus the active panel's path bar (browser-style)
+    auto* scEditPath = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_L), this);
+    connect(scEditPath, &QShortcut::activated, this, [this]() {
+        if (auto* pb = activePanel()->currentPathBar()) {
+            pb->enterEditMode();
+        }
+    });
+}
+
+// m_activePane 翻译为对应的 FilePanel 指针 —— 大多数槽（onCopy/onCut 等）
+// 都基于 active panel 操作。
+FilePanel* MainWindow::activePanel() const {
+    return (m_activePane == PanelSide::Left) ? m_leftPanel : m_rightPanel;
+}
+
+// ----- 简单导航：直接转发给 active panel -----
+void MainWindow::onBack() {
+    activePanel()->goBack();
+}
+
+void MainWindow::onForward() {
+    activePanel()->goForward();
+}
+
+void MainWindow::onUp() {
+    activePanel()->goUp();
+}
+
+// Refresh 只刷当前面板的文件列表，**不**重建左侧目录树。
+//
+// 之前的版本在这里调了 buildTree()，但 buildTree() 会 clear() 整棵树再从
+// 根重建，所有展开的节点被收起 —— 用户每按一次 Refresh 就要重新展开一遍，
+// 体验很差。目录树只在"新增/删除目录"等结构性变化时才需要重建，那些操作
+// （onDelete / onPaste / onToggleHidden 等）已经各自调了 buildTree()。
+//
+// 如果未来发现文件外部新增/删除的目录不同步，推荐做法是给 DirectoryTree
+// 加一个"只刷新子节点但保留展开状态"的 refreshNode()，而不是全量 rebuild。
+void MainWindow::onRefresh() {
+    activePanel()->refresh();
+}
+
+// 复制：把当前选中条目记入应用内剪贴板。注意这不是系统剪贴板。
+// 系统剪贴板（onCopyPath）用来复制路径文本到外部使用。
+void MainWindow::onCopy() {
+    auto selected = activePanel()->getSelectedEntries();
+    if (selected.isEmpty()) return;
+
+    ClipboardData clip;
+    clip.entries = selected;
+    clip.isCut = false;
+    clip.sourcePath = activePanel()->currentPath();
+    m_clipboard = clip;
+    updateStatusBar();
+}
+
+// 剪切：与 onCopy 区别仅 isCut=true，粘贴成功后会删除源（在 onPaste 内处理）
+void MainWindow::onCut() {
+    auto selected = activePanel()->getSelectedEntries();
+    if (selected.isEmpty()) return;
+
+    ClipboardData clip;
+    clip.entries = selected;
+    clip.isCut = true;
+    clip.sourcePath = activePanel()->currentPath();
+    m_clipboard = clip;
+    updateStatusBar();
+}
+
+// 粘贴：从应用内剪贴板把条目复制 / 移动到 active panel 当前目录。
+//
+// 关键决策：
+//   - 跨本地↔远程：当前不支持，明确弹窗，避免 QFile::copy 在 sftp:// 路径上静默失败
+//   - 进度推进按"叶子文件计数"而不是按顶层条目数 → 大目录进度条平滑
+//   - 移动：先尝试 QFile::rename（同设备 O(1)），跨设备失败时回退到 copy+delete
+//   - 用户取消：处理函数返回 false，打断循环但已完成的项保留（不回滚）
+void MainWindow::onPaste() {
+    if (!m_clipboard.has_value()) return;
+
+    auto& fs = RealFileSystem::instance();
+    QString destPath = activePanel()->currentPath();
+
+    // Local<->remote transfers are not implemented yet - bail out loudly
+    // instead of silently failing a QFile::copy on an "sftp://..." path.
+    if (FileSystemRouter::instance().isRemote(destPath) ||
+        FileSystemRouter::instance().isRemote(m_clipboard->sourcePath)) {
+        QMessageBox::information(this, "Not supported yet",
+            "Paste across local/remote is not supported in this build.");
+        return;
+    }
+    const bool isCut = m_clipboard->isCut;
+    const QString verbIng = isCut ? "Moving" : "Copying";
+    const QString verbDone = isCut ? "Moved" : "Copied";
+
+    // Pre-scan: total file count across all selected top-level entries.
+    // This way progress scales with actual work, not with selection count.
+    int totalFiles = 0;
+    for (const auto& entry : m_clipboard->entries) {
+        totalFiles += fs.countEntries(entry.path);
+    }
+    if (totalFiles <= 0) totalFiles = 1;  // guard div/zero
+
+    QProgressDialog progress(QString("%1 to %2...").arg(verbIng, destPath),
+                             "Cancel", 0, totalFiles, this);
+    progress.setWindowTitle(isCut ? "Move" : "Copy");
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(200);
+    progress.setAutoClose(true);
+    progress.setAutoReset(true);
+
+    int processed = 0;
+    int failedEntries = 0;
+    bool canceled = false;
+
+    auto progressFn = [&](const QString& currentPath, int count) -> bool {
+        progress.setValue(count);
+        QString name = QFileInfo(currentPath).fileName();
+        progress.setLabelText(QString("%1: %2").arg(verbIng, name));
+        QApplication::processEvents();
+        return !progress.wasCanceled();
+    };
+
+    for (const auto& entry : m_clipboard->entries) {
+        if (progress.wasCanceled()) { canceled = true; break; }
+
+        if (isCut) {
+            // Move: try QFile::rename first (fast, same filesystem). Fallback: copy+delete.
+            QString destFull = destPath + "/" + QFileInfo(entry.path).fileName();
+            if (QFile::rename(entry.path, destFull)) {
+                int n = fs.countEntries(destFull);
+                processed += n;
+                progress.setValue(processed);
+                progress.setLabelText(QString("Moved: %1").arg(entry.name));
+                QApplication::processEvents();
+            } else {
+                // Cross-device move — copy then delete
+                int before = processed;
+                bool ok = fs.copyFileWithProgress(entry.path, destPath, progressFn, processed);
+                if (!ok) {
+                    if (progress.wasCanceled()) { canceled = true; break; }
+                    failedEntries++;
+                    processed = before + fs.countEntries(entry.path);  // advance past failed
+                    continue;
+                }
+                int dummy = 0;
+                fs.deleteDirectoryWithProgress(entry.path, nullptr, dummy);
+            }
+        } else {
+            // Copy
+            bool ok = fs.copyFileWithProgress(entry.path, destPath, progressFn, processed);
+            if (!ok) {
+                if (progress.wasCanceled()) { canceled = true; break; }
+                failedEntries++;
+                processed += fs.countEntries(entry.path);  // skip past failed count
+            }
+        }
+    }
+    progress.setValue(totalFiles);
+
+    if (canceled) {
+        statusBar()->showMessage(
+            QString("%1 canceled").arg(verbDone), 3000);
+    } else if (failedEntries == 0) {
+        statusBar()->showMessage(
+            QString("%1 %2 item(s) to %3")
+                .arg(verbDone).arg(m_clipboard->entries.size()).arg(destPath),
+            3000);
+    } else {
+        statusBar()->showMessage(
+            QString("%1 with %2 failed item(s)").arg(verbDone).arg(failedEntries),
+            3000);
+    }
+
+    if (isCut) {
+        m_clipboard.reset();
+    }
+    activePanel()->refresh();
+    updateStatusBar();
+}
+
+// 拖拽复制：FilePanel 在 dropEvent 里 emit dropCopyRequested 触发本槽。
+// 与 onPaste 几乎对称（同样的远程边界守卫 + 进度对话框 + 失败计数），
+// 只是固定 isCut=false（拖拽语义就是"复制过去"）。完成后刷新的是
+// **目标侧** 面板而非 active panel —— 用户拖到非 active 那侧也会立刻看到。
+void MainWindow::onDropCopy(const QStringList& sourcePaths,
+                            const QString& destPath,
+                            PanelSide destSide) {
+    if (sourcePaths.isEmpty()) return;
+
+    // Drag&drop across local <-> remote is not supported in this build,
+    // mirroring onPaste's policy. Fail loud, not silent.
+    if (FileSystemRouter::instance().isRemote(destPath)) {
+        QMessageBox::information(this, "Not supported yet",
+            "Dropping into a remote (SFTP) folder is not supported in this build.");
+        return;
+    }
+    for (const QString& p : sourcePaths) {
+        if (FileSystemRouter::instance().isRemote(p)) {
+            QMessageBox::information(this, "Not supported yet",
+                "Dropping remote files into a local folder is not supported in this build.");
+            return;
+        }
+    }
+
+    auto& fs = RealFileSystem::instance();
+
+    // Pre-scan total work units so progress scales with leaf-file count.
+    int totalFiles = 0;
+    for (const QString& p : sourcePaths) {
+        totalFiles += fs.countEntries(p);
+    }
+    if (totalFiles <= 0) totalFiles = 1;
+
+    QProgressDialog progress(QString("Copying to %1...").arg(destPath),
+                             "Cancel", 0, totalFiles, this);
+    progress.setWindowTitle("Drop Copy");
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(200);
+    progress.setAutoClose(true);
+    progress.setAutoReset(true);
+
+    int processed = 0;
+    int failed    = 0;
+    bool canceled = false;
+
+    auto progressFn = [&](const QString& currentPath, int count) -> bool {
+        progress.setValue(count);
+        progress.setLabelText(QString("Copying: %1")
+            .arg(QFileInfo(currentPath).fileName()));
+        QApplication::processEvents();
+        return !progress.wasCanceled();
+    };
+
+    for (const QString& src : sourcePaths) {
+        if (progress.wasCanceled()) { canceled = true; break; }
+        bool ok = fs.copyFileWithProgress(src, destPath, progressFn, processed);
+        if (!ok) {
+            if (progress.wasCanceled()) { canceled = true; break; }
+            failed++;
+            processed += fs.countEntries(src);  // skip past failed entry
+        }
+    }
+    progress.setValue(totalFiles);
+
+    if (canceled) {
+        statusBar()->showMessage("Drop copy canceled", 3000);
+    } else if (failed == 0) {
+        statusBar()->showMessage(
+            QString("Copied %1 item(s) to %2").arg(sourcePaths.size()).arg(destPath),
+            3000);
+    } else {
+        statusBar()->showMessage(
+            QString("Copied with %1 failed item(s)").arg(failed), 3000);
+    }
+
+    // Refresh the *destination* panel (where the drop landed) so the new
+    // entries become visible immediately.
+    FilePanel* destPanel = (destSide == PanelSide::Left) ? m_leftPanel : m_rightPanel;
+    destPanel->refresh();
+    updateStatusBar();
+}
+
+// 删除：弹确认 + 进度对话框 + 失败计数。远程不支持。
+// 注意 deleteDirectoryWithProgress 走自底向上递归，rmdir 要求空目录。
+void MainWindow::onDelete() {
+    auto selected = activePanel()->getSelectedEntries();
+    if (selected.isEmpty()) return;
+
+    // Guard: remote delete is not implemented in this build.
+    for (const auto& e : selected) {
+        if (FileSystemRouter::instance().isRemote(e.path)) {
+            QMessageBox::information(this, "Not supported yet",
+                "Deleting remote files is not supported in this build.");
+            return;
+        }
+    }
+
+    auto reply = QMessageBox::question(this, "Delete",
+        QString("Delete %1 item(s)? This cannot be undone.").arg(selected.size()),
+        QMessageBox::Yes | QMessageBox::No);
+
+    if (reply != QMessageBox::Yes) return;
+
+    auto& fs = RealFileSystem::instance();
+
+    // Pre-scan: count every leaf file so progress scales with real work
+    int totalFiles = 0;
+    for (const auto& entry : selected) {
+        totalFiles += fs.countEntries(entry.path);
+    }
+    if (totalFiles <= 0) totalFiles = 1;
+
+    QProgressDialog progress(QString("Deleting %1 item(s)...").arg(selected.size()),
+                             "Cancel", 0, totalFiles, this);
+    progress.setWindowTitle("Delete");
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(200);
+    progress.setAutoClose(true);
+    progress.setAutoReset(true);
+
+    int processed = 0;
+    int failedEntries = 0;
+    bool canceled = false;
+
+    auto progressFn = [&](const QString& currentPath, int count) -> bool {
+        progress.setValue(count);
+        QString name = QFileInfo(currentPath).fileName();
+        progress.setLabelText(QString("Deleting: %1").arg(name));
+        QApplication::processEvents();
+        return !progress.wasCanceled();
+    };
+
+    for (const auto& entry : selected) {
+        if (progress.wasCanceled()) { canceled = true; break; }
+
+        bool ok = fs.deleteDirectoryWithProgress(entry.path, progressFn, processed);
+        if (!ok) {
+            if (progress.wasCanceled()) { canceled = true; break; }
+            failedEntries++;
+        }
+    }
+    progress.setValue(totalFiles);
+
+    if (canceled) {
+        statusBar()->showMessage("Delete canceled", 3000);
+    } else if (failedEntries == 0) {
+        statusBar()->showMessage(
+            QString("Deleted %1 item(s)").arg(selected.size()), 3000);
+    } else {
+        statusBar()->showMessage(
+            QString("Deleted with %1 failed item(s)").arg(failedEntries), 3000);
+    }
+    activePanel()->refresh();
+}
+
+void MainWindow::onSelectAll() {
+    activePanel()->selectAll();
+}
+
+// 把当前路径写入"系统"剪贴板（QGuiApplication::clipboard），方便用户在
+// 终端 / 浏览器 / 其它应用粘贴。区别于应用内 m_clipboard（那个存条目）。
+void MainWindow::onCopyPath() {
+    auto selected = activePanel()->getSelectedEntries();
+    QString paths;
+    if (selected.isEmpty()) {
+        paths = activePanel()->currentPath();
+    } else {
+        QStringList pathList;
+        for (const auto& e : selected) {
+            pathList.append(e.path);
+        }
+        paths = pathList.join("\n");
+    }
+    QApplication::clipboard()->setText(paths);
+    statusBar()->showMessage("Path copied to clipboard", 2000);
+}
+
+// 弹出 ScriptDialog 选脚本/参数运行（用 QProcess 异步执行）
+void MainWindow::onRunScript() {
+    auto selected = activePanel()->getSelectedEntries();
+    ScriptDialog dlg(selected, this);
+    dlg.exec();
+}
+
+// 弹出 SearchDialog 在 active panel 当前目录递归搜索；点击结果会
+// navigateTo 该项的父目录。
+void MainWindow::onSearch() {
+    SearchDialog dlg(activePanel()->currentPath(), this);
+    connect(&dlg, &SearchDialog::navigateToPath, this, [this](const QString& path) {
+        activePanel()->navigateTo(path);
+    });
+    dlg.exec();
+}
+
+// ---------------------------------------------------------------------------
+// 压缩为 zip：把 active panel 当前选中的条目（可包含目录）打成一个 .zip 放
+// 到当前目录下。实现走系统 /usr/bin/zip（macOS 自带 Info-ZIP），跨平台解压
+// 兼容性最好。
+//
+// 关键决策：
+//   - 子进程异步：用 QProcess + QProgressDialog；stderr 出现 "  adding: <name>"
+//     时推进度（按文件计数对照 RealFileSystem::countEntries 估的 totalFiles）。
+//   - 取消：QProgressDialog::wasCanceled → kill QProcess → 删掉部分写入的 .zip。
+//   - 工作目录：把 zip 进程 chdir 到 active panel 当前目录，然后用相对路径作
+//     输入；这样 zip 包内的目录树是干净的（"foo/bar.txt" 而不是
+//     "/Users/me/proj/foo/bar.txt"）。
+//   - 命名冲突：目标 .zip 已存在则追加 "-2"、"-3"…
+//   - 远程：本地 zip 命令操作不了 sftp:// 路径，明确弹窗拒绝。
+// ---------------------------------------------------------------------------
+void MainWindow::onCompressZip() {
+    auto selected = activePanel()->getSelectedEntries();
+    if (selected.isEmpty()) return;
+
+    QString cwd = activePanel()->currentPath();
+
+    // 远程边界守卫：源或目标任一在远端就拒绝
+    if (FileSystemRouter::instance().isRemote(cwd)) {
+        QMessageBox::information(this, "Not supported yet",
+            "Compressing into a remote (SFTP) folder is not supported in this build.");
+        return;
+    }
+    for (const auto& e : selected) {
+        if (FileSystemRouter::instance().isRemote(e.path)) {
+            QMessageBox::information(this, "Not supported yet",
+                "Compressing remote files is not supported in this build.");
+            return;
+        }
+    }
+
+    // 决定输出文件名：单选用 basename，多选用 "Archive"，已存在则加后缀
+    QString baseName;
+    if (selected.size() == 1) {
+        baseName = QFileInfo(selected.first().path).completeBaseName();
+        if (baseName.isEmpty()) baseName = selected.first().name;
+    } else {
+        baseName = "Archive";
+    }
+    QString outPath = cwd + "/" + baseName + ".zip";
+    int counter = 2;
+    while (QFileInfo::exists(outPath)) {
+        outPath = cwd + "/" + baseName + "-" + QString::number(counter++) + ".zip";
+    }
+
+    // 估算总文件数（zip 每加一个文件输出一行，作为进度刻度）
+    auto& fs = RealFileSystem::instance();
+    int totalFiles = 0;
+    for (const auto& e : selected) totalFiles += fs.countEntries(e.path);
+    if (totalFiles <= 0) totalFiles = 1;
+
+    QProgressDialog progress(QString("Compressing to %1 ...")
+                                 .arg(QFileInfo(outPath).fileName()),
+                             "Cancel", 0, totalFiles, this);
+    progress.setWindowTitle("Compress");
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(200);
+    progress.setAutoClose(true);
+    progress.setAutoReset(true);
+
+    // 装配 zip 命令：-r 递归，-q 关掉冗余输出，但用 -dg / -du 等选项打不开
+    // "每文件一行"，所以这里改用 -v（verbose）的中间方案：去掉 -q，让 zip
+    // 在 stderr 输出 "  adding: <name>"；我们扫这些行计数。
+    QProcess proc;
+    proc.setWorkingDirectory(cwd);
+    proc.setProcessChannelMode(QProcess::MergedChannels);  // stdout/stderr 合并
+
+    int processed = 0;
+    bool canceled = false;
+    QObject::connect(&proc, &QProcess::readyRead, &progress, [&]() {
+        const QByteArray chunk = proc.readAll();
+        // 每出现一行 "adding: " / "updating: " 就算前进一格
+        int adds = chunk.count("\n  adding:")
+                 + chunk.count("\n  updating:");
+        // 处理首行（没有 leading newline 的情况）
+        if (chunk.startsWith("  adding:") || chunk.startsWith("  updating:"))
+            adds += 1;
+        processed += adds;
+        if (processed > totalFiles) processed = totalFiles;
+        progress.setValue(processed);
+    });
+
+    QObject::connect(&progress, &QProgressDialog::canceled, &proc, [&]() {
+        canceled = true;
+        if (proc.state() != QProcess::NotRunning) proc.kill();
+    });
+
+    QStringList args{"-r", "-X", outPath};   // -X 不写入 macOS 扩展属性
+    for (const auto& e : selected) {
+        // 用相对路径，让 zip 内部的目录结构干净
+        args << QFileInfo(e.path).fileName();
+    }
+    proc.start("/usr/bin/zip", args);
+    if (!proc.waitForStarted(3000)) {
+        QMessageBox::warning(this, "Compress failed",
+            QString("Could not start /usr/bin/zip: %1").arg(proc.errorString()));
+        return;
+    }
+
+    // 阻塞等待结束（同时让 progress 处理事件循环）
+    while (proc.state() != QProcess::NotRunning) {
+        QApplication::processEvents(QEventLoop::AllEvents, 50);
+        proc.waitForFinished(50);
+    }
+    progress.setValue(totalFiles);
+
+    bool compressedOk = false;
+    if (canceled) {
+        // 删掉可能写了一半的输出文件
+        QFile::remove(outPath);
+        statusBar()->showMessage("Compression canceled", 3000);
+    } else if (proc.exitStatus() == QProcess::NormalExit && proc.exitCode() == 0) {
+        compressedOk = true;
+        statusBar()->showMessage(
+            QString("Created %1 (%2 item(s))")
+                .arg(QFileInfo(outPath).fileName()).arg(selected.size()),
+            4000);
+    } else {
+        QFile::remove(outPath);
+        QString stderrText = QString::fromUtf8(proc.readAll());
+        QMessageBox::warning(this, "Compress failed",
+            QString("zip exited with code %1\n\n%2")
+                .arg(proc.exitCode()).arg(stderrText.left(500)));
+    }
+
+    activePanel()->refresh();
+
+    // 压缩成功 → 自动选中新生成的 .zip 文件，与解压完成后选中输出目录的
+    // 行为对偶。selectByPath 找不到时无声跳过（用户可能切换了 active panel
+    // 或导航走了），不会打扰用户。
+    if (compressedOk) {
+        if (auto* fl = activePanel()->currentFileList()) {
+            fl->selectByPath(outPath);
+        }
+    }
+    updateStatusBar();
+}
+
+// ---------------------------------------------------------------------------
+// 解压：双击 .zip / .tar.gz / .tgz / .tar.bz2 / .tbz / .tar.xz / .txz / .tar
+// 时调用。在压缩包所在目录创建 <basename>/ 子目录并解压进去（同名冲突追加
+// "-2/-3..."），不让系统 Finder/Archive Utility 接管。
+//
+// 命令分发：
+//   .zip                       → /usr/bin/unzip -q -o <archive> -d <outDir>
+//   .tar / .tar.gz / .tgz /
+//   .tar.bz2 / .tbz / .tbz2 /
+//   .tar.xz / .txz             → /usr/bin/tar -xf <archive> -C <outDir>
+//                                （tar 自动识别 gz/bz2/xz）
+//
+// 取消：QProgressDialog::canceled → kill 子进程 → 删半成品输出目录。
+// 远程：远程压缩包不会触发本槽（FileListView 已过滤 sftp://）；保险起见
+// 这里再守一道。
+// ---------------------------------------------------------------------------
+void MainWindow::onExtractArchive(const QString& archivePath, PanelSide side) {
+    if (FileSystemRouter::instance().isRemote(archivePath)) {
+        QMessageBox::information(this, "Not supported yet",
+            "Extracting remote archives is not supported in this build.");
+        return;
+    }
+    QFileInfo fi(archivePath);
+    if (!fi.exists() || !fi.isFile()) return;
+
+    // 推断 "干净" basename：去掉所有压缩链后缀
+    //   foo.tar.gz  → foo
+    //   bar.tgz     → bar
+    //   baz.zip     → baz
+    QString lower = fi.fileName().toLower();
+    QString stem  = fi.fileName();
+    auto stripIfMatch = [&](const QString& suf) {
+        if (lower.endsWith(suf)) {
+            stem  = stem.left(stem.size() - suf.size());
+            lower = lower.left(lower.size() - suf.size());
+            return true;
+        }
+        return false;
+    };
+    // 复合后缀优先（先剥 .gz/.bz2/.xz 再剥 .tar 不行，因为可能本就是 .tar）
+    if (!stripIfMatch(".tar.gz")  && !stripIfMatch(".tgz")
+     && !stripIfMatch(".tar.bz2") && !stripIfMatch(".tbz2")
+     && !stripIfMatch(".tbz")
+     && !stripIfMatch(".tar.xz")  && !stripIfMatch(".txz")
+     && !stripIfMatch(".zip")
+     && !stripIfMatch(".tar")) {
+        // 不该走到这里 —— FileListView::isSupportedArchive 已经过滤
+        return;
+    }
+    if (stem.isEmpty()) stem = "Extracted";
+
+    const QString parentDir = fi.absolutePath();
+    QString outDir = parentDir + "/" + stem;
+    int counter = 2;
+    while (QFileInfo::exists(outDir)) {
+        outDir = parentDir + "/" + stem + "-" + QString::number(counter++);
+    }
+    if (!QDir().mkpath(outDir)) {
+        QMessageBox::warning(this, "Extract failed",
+            QString("Could not create output directory:\n%1").arg(outDir));
+        return;
+    }
+
+    // 选解压命令
+    QString program;
+    QStringList args;
+    if (lower.isEmpty()) lower = fi.fileName().toLower();   // safety
+    const QString origLower = fi.fileName().toLower();
+    if (origLower.endsWith(".zip")) {
+        program = "/usr/bin/unzip";
+        // -q 安静模式（仍会输出每个文件名到 stdout，便于推进度），
+        // -o 覆盖已存在文件而不询问，-d 指定输出目录
+        args << "-o" << archivePath << "-d" << outDir;
+    } else {
+        // tar 自带 gzip/bzip2/xz 自动识别（-x 即 detect-and-decompress）
+        program = "/usr/bin/tar";
+        args << "-xvf" << archivePath << "-C" << outDir;
+        // -v 让 tar 每解一个文件输出一行到 stderr，便于推进度
+    }
+
+    // 进度估算：用压缩包大小做 progressMax 的代替（解出条目数事先不知道）。
+    // 我们按"解压输出行数"推一个粗略进度；若行数远超估算，clamp 在 max-1。
+    int totalRough = qMax(1, int(fi.size() / 1024)); // 每 KB 算 1 个 tick
+    QProgressDialog progress(QString("Extracting %1 ...")
+                                 .arg(fi.fileName()),
+                             "Cancel", 0, totalRough, this);
+    progress.setWindowTitle("Extract");
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(200);
+    progress.setAutoClose(true);
+    progress.setAutoReset(true);
+
+    QProcess proc;
+    proc.setProcessChannelMode(QProcess::MergedChannels);
+
+    int ticks = 0;
+    bool canceled = false;
+    QObject::connect(&proc, &QProcess::readyRead, &progress, [&]() {
+        const QByteArray chunk = proc.readAll();
+        // 每行 ≈ 一个文件
+        ticks += chunk.count('\n');
+        int show = qMin(ticks * 4, totalRough - 1);   // 给 max-1 留点余量
+        progress.setValue(show);
+    });
+    QObject::connect(&progress, &QProgressDialog::canceled, &proc, [&]() {
+        canceled = true;
+        if (proc.state() != QProcess::NotRunning) proc.kill();
+    });
+
+    proc.start(program, args);
+    if (!proc.waitForStarted(3000)) {
+        QMessageBox::warning(this, "Extract failed",
+            QString("Could not start %1: %2").arg(program, proc.errorString()));
+        QDir(outDir).removeRecursively();
+        return;
+    }
+    while (proc.state() != QProcess::NotRunning) {
+        QApplication::processEvents(QEventLoop::AllEvents, 50);
+        proc.waitForFinished(50);
+    }
+    progress.setValue(totalRough);
+
+    bool extractedOk = false;
+    if (canceled) {
+        QDir(outDir).removeRecursively();
+        statusBar()->showMessage("Extraction canceled", 3000);
+    } else if (proc.exitStatus() == QProcess::NormalExit && proc.exitCode() == 0) {
+        extractedOk = true;
+        statusBar()->showMessage(
+            QString("Extracted to %1").arg(QFileInfo(outDir).fileName()),
+            4000);
+    } else {
+        QString stderrText = QString::fromUtf8(proc.readAll());
+        QDir(outDir).removeRecursively();
+        QMessageBox::warning(this, "Extract failed",
+            QString("%1 exited with code %2\n\n%3")
+                .arg(program).arg(proc.exitCode()).arg(stderrText.left(500)));
+    }
+
+    // 刷新解压发起的那一侧面板（不一定是 active）
+    FilePanel* panel = (side == PanelSide::Left) ? m_leftPanel : m_rightPanel;
+    panel->refresh();
+
+    // 解压成功 → 自动选中新生成的输出目录，让用户立刻看到结果在哪。
+    // 仅在面板当前还停留在压缩包所在目录时才选中（用户可能已经导航走了，
+    // 那时 outDir 不在视图里，selectByPath 会无声失败也无害）。
+    if (extractedOk) {
+        if (auto* fl = panel->currentFileList()) {
+            fl->selectByPath(outDir);
+        }
+    }
+    updateStatusBar();
+}
+
+// 远程连接：弹 RemoteDialog → 用户填表 → SftpClient::connectAndAuth →
+// 成功后 RemoteDialog::takeClient() 转交活会话给我们 → 挂到 router → 跳到 sftp://
+// mountPrefix 同时也是 router 里的 key，断开时用它来 unmount。
+void MainWindow::onRemoteConnect() {
+    RemoteDialog dlg(this);
+    bool succeeded = false;
+    RemoteConnection accepted;
+    connect(&dlg, &RemoteDialog::connectRequested, this,
+            [&succeeded, &accepted](const RemoteConnection& conn) {
+        succeeded = true;
+        accepted = conn;
+    });
+    if (dlg.exec() != QDialog::Accepted || !succeeded) {
+        return;  // user cancelled, or connect failed (dialog already showed why)
+    }
+    auto client = dlg.takeClient();
+    if (!client) {
+        statusBar()->showMessage("Internal error: no live session handed off", 3000);
+        return;
+    }
+
+    // Build a mount prefix and register the live session with the router so
+    // every panel / tree listing that walks into this URL goes over SFTP.
+    const QString mount = QString("sftp://%1@%2:%3")
+        .arg(accepted.username, accepted.host).arg(accepted.port);
+
+    // If there's a stale mount at the same prefix (reconnect), drop it first
+    // so the old session is torn down deterministically.
+    if (!m_remoteMountPrefix.isEmpty()) {
+        FileSystemRouter::instance().unmount(m_remoteMountPrefix);
+    }
+    FileSystemRouter::instance().mount(mount, std::move(client));
+    m_remoteMountPrefix = mount;
+
+    m_isRemoteConnected = true;
+    // Navigate the active panel into the remote root. The router will
+    // transparently serve the directory listing over SFTP.
+    activePanel()->navigateTo(mount + "/");
+    m_remoteConnectAction->setEnabled(false);
+    m_remoteDisconnectAction->setEnabled(true);
+    statusBar()->showMessage(
+        QString("Connected: %1  (%2)")
+            .arg(mount)
+            .arg(accepted.fingerprint.isEmpty() ? "no fingerprint" : accepted.fingerprint),
+        5000);
+    updateStatusBar();
+}
+
+// 远程断开：先把双面板都导航回本地 home，再 unmount。
+// 顺序很重要：unmount 会析构 SftpClient（disconnect SSH），如果先 unmount，
+// 仍指向 sftp:// 的面板下一次 refresh 会撞到死指针。
+void MainWindow::onRemoteDisconnect() {
+    // Send panels home BEFORE tearing the mount down, otherwise any pending
+    // refresh would hit a dead client.
+    activePanel()->navigateTo(QDir::homePath());
+    m_leftPanel->navigateTo(QDir::homePath());
+    m_rightPanel->navigateTo(QDir::homePath());
+
+    if (!m_remoteMountPrefix.isEmpty()) {
+        FileSystemRouter::instance().unmount(m_remoteMountPrefix);
+        m_remoteMountPrefix.clear();
+    }
+
+    m_isRemoteConnected = false;
+    m_dirTree->buildTree();
+    m_dirTree->highlightPath(m_leftPanel->currentPath(), PanelSide::Left);
+    m_dirTree->highlightPath(m_rightPanel->currentPath(), PanelSide::Right);
+    m_remoteConnectAction->setEnabled(true);
+    m_remoteDisconnectAction->setEnabled(false);
+    statusBar()->showMessage("Disconnected - returned to home directory", 3000);
+    updateStatusBar();
+}
+
+void MainWindow::onToggleTheme() {
+    m_isDarkTheme = !m_isDarkTheme;
+    if (m_isDarkTheme) {
+        applyDarkTheme();
+        m_themeAction->setText("Theme: Dark");
+    } else {
+        applyLightTheme();
+        m_themeAction->setText("Theme: Light");
+    }
+}
+
+// 隐藏文件开关：通过 router 一次性广播到本地+所有 SFTP 后端，再刷新两面板
+void MainWindow::onToggleHidden() {
+    bool show = m_hiddenAction->isChecked();
+    // Propagate to every backend (local + every live SFTP mount) in one call.
+    FileSystemRouter::instance().setShowHidden(show);
+
+    // Refresh both panels so the listings reflect the new filter immediately
+    m_leftPanel->refresh();
+    m_rightPanel->refresh();
+
+    // Rebuild the directory tree so hidden directories appear/disappear
+    m_dirTree->buildTree();
+    m_dirTree->highlightPath(m_leftPanel->currentPath(), PanelSide::Left);
+    m_dirTree->highlightPath(m_rightPanel->currentPath(), PanelSide::Right);
+
+    statusBar()->showMessage(show ? "Showing hidden files" : "Hiding hidden files", 2000);
+}
+
+// 面板路径变了：同步左侧目录树高亮 + 状态栏文字
+void MainWindow::onPanelPathChanged(const QString& path, PanelSide side) {
+    m_dirTree->highlightPath(path, side);
+    m_dirTree->expandToPath(path);
+    updateStatusBar();
+}
+
+// 面板内选中项变化 —— 刷新状态栏即可
+void MainWindow::onPanelSelectionChanged(PanelSide /*side*/) {
+    updateStatusBar();
+}
+
+// 哪个面板是 "active"（最近被点击/获焦）—— 决定快捷键和工具栏作用对象
+void MainWindow::onPanelActivated(PanelSide side) {
+    m_activePane = side;
+    updateStatusBar();
+}
+
+// 左侧目录树点击：导航 active panel 过去
+void MainWindow::onDirectoryTreeSelected(const QString& path) {
+    activePanel()->navigateTo(path);
+}
+
+// ---------------------------------------------------------------------------
+// "打开方式..." 子菜单的辅助函数（仅本翻译单元用）
+//
+// 设计选择：不引入 Objective-C++。在 macOS 上用纯命令行机制：
+//   - 默认打开 → QDesktopServices::openUrl（走 Launch Services 默认绑定）
+//   - 指定应用打开 → `open -a "<AppName>" <file>`，等同 Finder "用...打开"
+//   - "选择其它应用..." → AppleScript `choose application` 弹标准选择器，
+//     再通过 `open -a` 启动
+//   - 候选列表 → 扫描 /Applications 与 ~/Applications 下的 .app，挑常见
+//     编辑器/查看器（VS Code、Sublime、TextEdit、Preview、IntelliJ、
+//     BBEdit、Atom 等），仅当这些 .app 实际存在时才展示
+//
+// 这种做法：零 Obj-C 依赖、跨用户应用目录、保留 macOS 原生选择对话框体验。
+// 局限：候选列表不会自动按文件类型 narrow，但用户随时可走"选择其它应用..."
+// 弹原生对话框做精确选择。
+// ---------------------------------------------------------------------------
+namespace {
+
+/// 用系统默认应用打开 path（Finder/Launch Services / xdg-open / ShellExecute）
+void openWithDefault(const QString& path) {
+    QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+}
+
+/// macOS 上：用指定 .app（绝对路径或应用显示名）打开 file
+void openWithApp(const QString& appNameOrPath, const QString& filePath) {
+    // open(1) 是 macOS 自带工具；-a 接应用名或 .app 路径都行
+    QProcess::startDetached("/usr/bin/open",
+        QStringList{ "-a", appNameOrPath, filePath });
+}
+
+/// 弹 macOS 原生"选择应用"对话框（AppleScript），用户挑完用其打开 file。
+/// 用户取消则什么都不做。
+void chooseAndOpen(const QString& filePath) {
+    // AppleScript 的 'choose application as alias' 返回选中应用的 alias，
+    // 取 POSIX path 即得到 .app 绝对路径
+    const QString script = QStringLiteral(
+        "set theApp to choose application as alias\n"
+        "POSIX path of theApp");
+
+    QProcess proc;
+    proc.start("/usr/bin/osascript", QStringList{"-e", script});
+    if (!proc.waitForFinished(60000)) {       // 用户可能要慢慢挑
+        proc.kill();
+        return;
+    }
+    if (proc.exitCode() != 0) return;          // 用户取消会非 0 退出
+    QString appPath = QString::fromUtf8(proc.readAllStandardOutput()).trimmed();
+    if (appPath.isEmpty()) return;
+    if (appPath.endsWith('/')) appPath.chop(1);  // POSIX path 末尾常带 /
+    openWithApp(appPath, filePath);
+}
+
+/// 扫描 macOS 上常见的 .app 目录，挑出"常用编辑器/查看器"中实际安装的那些。
+/// 返回 (显示名, .app 路径) 列表，按显示名字典序。
+QVector<QPair<QString, QString>> commonInstalledApps() {
+    // 候选清单：覆盖大多数开发者/普通用户的"打开方式"诉求
+    static const char* const kCandidates[] = {
+        "Visual Studio Code.app",
+        "Sublime Text.app",
+        "TextEdit.app",
+        "Preview.app",
+        "Xcode.app",
+        "BBEdit.app",
+        "Atom.app",
+        "IntelliJ IDEA.app",
+        "PyCharm.app",
+        "CLion.app",
+        "Cursor.app",
+        "Zed.app",
+        "MacVim.app",
+        "Safari.app",
+        "Google Chrome.app",
+        "Firefox.app",
+        "iTerm.app",
+        "Terminal.app",
+    };
+
+    // 候选目录：系统级 + 用户级
+    const QStringList searchRoots {
+        QStringLiteral("/Applications"),
+        QDir::homePath() + "/Applications",
+    };
+
+    QVector<QPair<QString, QString>> found;
+    for (const char* name : kCandidates) {
+        for (const QString& root : searchRoots) {
+            QString full = root + "/" + QString::fromLatin1(name);
+            if (QFileInfo::exists(full)) {
+                QString display = QString::fromLatin1(name);
+                display.chop(4);    // 去掉 ".app" 后缀
+                found.append(qMakePair(display, full));
+                break;              // 同名只收第一份
+            }
+        }
+    }
+    std::sort(found.begin(), found.end(),
+              [](const auto& a, const auto& b){ return a.first < b.first; });
+    return found;
+}
+
+} // namespace
+
+// 右键菜单：动态构建（Open / Copy / Cut / Paste / Delete / Copy Path / ...）。
+// 项是否可用 / 是否出现根据当前选中状态决定。
+//
+// "Open With" 子菜单仅在恰好选中一个 *本地、非目录* 条目时显示 ——
+// 远程 SFTP 路径无法用 macOS open(1) 启动；多选语义不清；目录用双击打开。
+void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
+    m_activePane = side;
+
+    QMenu menu(this);
+
+    // ---- "Open With" / "Open" 子菜单（仅单选本地文件时展示） ----
+    QVector<FileEntry> sel = activePanel()->getSelectedEntries();
+    bool canOfferOpenWith = false;
+    QString openTargetPath;
+    if (sel.size() == 1) {
+        const FileEntry& e = sel.first();
+        if (!e.isDirectory && !FileSystemRouter::instance().isRemote(e.path)) {
+            canOfferOpenWith = true;
+            openTargetPath = e.path;
+        }
+    }
+
+    if (canOfferOpenWith) {
+        // "Open" 顶层项 = 双击行为（系统默认应用）
+        menu.addAction("Open", this, [openTargetPath]() {
+            openWithDefault(openTargetPath);
+        });
+
+        // "Open With ▶" 子菜单：列出已安装的常用应用 + "其它..."
+        QMenu* openWithMenu = menu.addMenu("Open With");
+
+        // Finder 风格的"默认应用"放在子菜单顶端
+        openWithMenu->addAction("Default Application", this,
+            [openTargetPath]() { openWithDefault(openTargetPath); });
+        openWithMenu->addSeparator();
+
+        const auto apps = commonInstalledApps();
+        for (const auto& app : apps) {
+            const QString display = app.first;
+            const QString appPath = app.second;
+            openWithMenu->addAction(display, this,
+                [appPath, openTargetPath]() {
+                    openWithApp(appPath, openTargetPath);
+                });
+        }
+
+        if (!apps.isEmpty()) openWithMenu->addSeparator();
+
+        openWithMenu->addAction("Other Application…", this,
+            [openTargetPath]() { chooseAndOpen(openTargetPath); });
+
+        menu.addSeparator();
+    }
+
+    // NOTE: "\tCtrl+X" in Qt QAction text is auto-translated to "⌘X" display
+    // on macOS. The actual QShortcut bindings are registered in setupShortcuts()
+    // using Qt::CTRL | Qt::Key_X (which maps to Cmd on macOS, Ctrl elsewhere).
+    menu.addAction("Copy\tCtrl+C", this, &MainWindow::onCopy);
+    menu.addAction("Cut\tCtrl+X", this, &MainWindow::onCut);
+    menu.addAction("Paste\tCtrl+V", this, &MainWindow::onPaste);
+    menu.addSeparator();
+    menu.addAction("Delete\tDel", this, &MainWindow::onDelete);
+    menu.addSeparator();
+    menu.addAction("Copy Path", this, &MainWindow::onCopyPath);
+    menu.addAction("Copy File Name", this, [this]() {
+        auto selected = activePanel()->getSelectedEntries();
+        if (!selected.isEmpty()) {
+            QStringList names;
+            for (const auto& e : selected) {
+                names.append(e.name);
+            }
+            QApplication::clipboard()->setText(names.join("\n"));
+            statusBar()->showMessage("File name(s) copied", 2000);
+        }
+    });
+    menu.addSeparator();
+
+    // 仅当至少选了一项、且全部是本地路径时显示"压缩为 ZIP"
+    bool hasLocalSelection = !sel.isEmpty();
+    for (const auto& e : sel) {
+        if (FileSystemRouter::instance().isRemote(e.path)) {
+            hasLocalSelection = false; break;
+        }
+    }
+    if (hasLocalSelection) {
+        const QString label = (sel.size() == 1)
+            ? QString("Compress \"%1\" to ZIP").arg(sel.first().name)
+            : QString("Compress %1 items to ZIP").arg(sel.size());
+        menu.addAction(label, this, &MainWindow::onCompressZip);
+        menu.addSeparator();
+    }
+
+    menu.addAction("Run Script\tCtrl+E", this, &MainWindow::onRunScript);
+
+    menu.exec(pos);
+}
+
+// 重新计算状态栏四个 label 的内容（条目数 / 选中数 / 剪贴板 / 活跃面板）
+void MainWindow::updateStatusBar() {
+    // Count folders and files in active panel
+    auto* fl = activePanel()->currentFileList();
+    if (!fl) return;
+
+    const auto& entries = fl->entries();
+    int folderCount = 0, fileCount = 0;
+    qint64 totalSize = 0;
+    for (const auto& e : entries) {
+        if (e.name == "." || e.name == "..") continue;
+        if (e.isDirectory) folderCount++;
+        else {
+            fileCount++;
+            totalSize += e.size;
+        }
+    }
+
+    QString sizeStr;
+    if (totalSize < 1024) sizeStr = QString::number(totalSize) + " B";
+    else if (totalSize < 1024 * 1024) sizeStr = QString::number(totalSize / 1024.0, 'f', 1) + " KB";
+    else if (totalSize < 1024LL * 1024 * 1024) sizeStr = QString::number(totalSize / (1024.0 * 1024.0), 'f', 1) + " MB";
+    else sizeStr = QString::number(totalSize / (1024.0 * 1024.0 * 1024.0), 'f', 1) + " GB";
+
+    m_statusLeft->setText(QString("%1 folders, %2 files (%3)").arg(folderCount).arg(fileCount).arg(sizeStr));
+
+    // Selection info
+    auto selected = activePanel()->getSelectedEntries();
+    if (!selected.isEmpty()) {
+        qint64 selSize = 0;
+        for (const auto& e : selected) selSize += e.size;
+        QString selSizeStr;
+        if (selSize < 1024) selSizeStr = QString::number(selSize) + " B";
+        else if (selSize < 1024 * 1024) selSizeStr = QString::number(selSize / 1024.0, 'f', 1) + " KB";
+        else selSizeStr = QString::number(selSize / (1024.0 * 1024.0), 'f', 1) + " MB";
+        m_statusRight->setText(QString("Selected: %1 item(s), %2").arg(selected.size()).arg(selSizeStr));
+    } else {
+        m_statusRight->setText("");
+    }
+
+    // Clipboard info
+    if (m_clipboard.has_value()) {
+        QString action = m_clipboard->isCut ? "Cut" : "Copied";
+        m_statusClipboard->setText(QString("Clipboard: %1 %2 item(s)").arg(action).arg(m_clipboard->entries.size()));
+    } else {
+        m_statusClipboard->setText("");
+    }
+
+    // Active panel
+    QString panelStr = (m_activePane == PanelSide::Left) ? "Left Panel" : "Right Panel";
+    if (m_isRemoteConnected) panelStr += " [Remote]";
+    m_statusPanel->setText(panelStr);
+}
+
+// 暗色主题：Nord 配色 (#2E3440 系列)。整片 stylesheet 注入到 QApplication，
+// 所有子控件都会继承。修改时记得对照 applyLightTheme 保持对偶。
+void MainWindow::applyDarkTheme() {
+    // ===== Nord Theme palette =====
+    // Polar Night:  #2E3440 / #3B4252 / #434C5E / #4C566A
+    // Snow Storm:   #D8DEE9 / #E5E9F0 / #ECEFF4
+    // Frost:        #8FBCBB / #88C0D0 / #81A1C1 / #5E81AC
+    // Aurora:       #BF616A / #D08770 / #EBCB8B / #A3BE8C / #B48EAD
+    QString qss = R"(
+        QMainWindow, QWidget {
+            background-color: #2E3440;
+            color: #D8DEE9;
+        }
+        QSplitter::handle {
+            background-color: #4C566A;
+            width: 2px;
+        }
+        QSplitter::handle:hover {
+            background-color: #88C0D0;
+        }
+        QToolBar {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3B4252, stop:1 #2E3440);
+            border-bottom: 2px solid #5E81AC;
+            spacing: 4px;
+            padding: 4px;
+        }
+        QToolBar QToolButton {
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 4px;
+            padding: 4px 10px;
+            color: #E5E9F0;
+        }
+        QToolBar QToolButton:hover {
+            background: rgba(136, 192, 208, 0.15);
+            border-color: #88C0D0;
+            color: #88C0D0;
+        }
+        QToolBar QToolButton:pressed {
+            background: rgba(136, 192, 208, 0.30);
+        }
+        QToolBar QToolButton:checked {
+            background: rgba(143, 188, 187, 0.25);
+            border-color: #8FBCBB;
+            color: #8FBCBB;
+        }
+        QTabWidget::pane {
+            border: 1px solid #434C5E;
+            background-color: #2E3440;
+            top: -1px;
+        }
+        QTabWidget::tab-bar {
+            alignment: left;
+            left: 0;
+        }
+        QTabBar {
+            alignment: left;
+            qproperty-drawBase: 0;
+        }
+        QTabBar::tab {
+            background-color: #3B4252;
+            color: #81A1C1;
+            padding: 6px 14px;
+            border: 1px solid #434C5E;
+            border-bottom: none;
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+            margin-right: 2px;
+        }
+        QTabBar::tab:selected {
+            background-color: #434C5E;
+            color: #88C0D0;
+            border-bottom: 2px solid #88C0D0;
+            font-weight: bold;
+        }
+        QTabBar::tab:hover:!selected {
+            background-color: #434C5E;
+            color: #E5E9F0;
+        }
+        QTreeWidget, QTableWidget {
+            background-color: #2E3440;
+            color: #D8DEE9;
+            border: 1px solid #434C5E;
+            alternate-background-color: #353B48;
+            gridline-color: #3B4252;
+            selection-background-color: rgba(136, 192, 208, 0.25);
+            outline: 0;
+        }
+        QTreeWidget::item, QTableWidget::item {
+            padding: 3px 4px;
+            border: none;
+        }
+        QTreeWidget::item:hover, QTableWidget::item:hover {
+            background-color: rgba(136, 192, 208, 0.10);
+        }
+        QTreeWidget::item:selected, QTableWidget::item:selected {
+            background-color: rgba(136, 192, 208, 0.28);
+            color: #ECEFF4;
+        }
+        QTreeWidget::branch:has-siblings:!adjoins-item,
+        QTreeWidget::branch:has-siblings:adjoins-item,
+        QTreeWidget::branch:!has-children:!has-siblings:adjoins-item {
+            border-image: none;
+        }
+        QHeaderView::section {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #434C5E, stop:1 #3B4252);
+            color: #88C0D0;
+            border: none;
+            border-right: 1px solid #4C566A;
+            border-bottom: 1px solid #4C566A;
+            padding: 5px 8px;
+            font-weight: bold;
+        }
+        QStatusBar {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3B4252, stop:1 #2E3440);
+            color: #88C0D0;
+            border-top: 1px solid #5E81AC;
+            padding: 2px;
+        }
+        QStatusBar QLabel {
+            color: #D8DEE9;
+            padding: 0 8px;
+        }
+        QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
+            background-color: #3B4252;
+            color: #ECEFF4;
+            border: 1px solid #434C5E;
+            border-radius: 4px;
+            padding: 4px 8px;
+            selection-background-color: #5E81AC;
+            selection-color: #ECEFF4;
+        }
+        QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
+            border-color: #88C0D0;
+            background-color: #434C5E;
+        }
+        QComboBox::drop-down {
+            border: none;
+            width: 20px;
+        }
+        QComboBox QAbstractItemView {
+            background: #3B4252;
+            color: #E5E9F0;
+            selection-background-color: #5E81AC;
+            border: 1px solid #4C566A;
+        }
+        QPushButton {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #434C5E, stop:1 #3B4252);
+            color: #E5E9F0;
+            border: 1px solid #4C566A;
+            border-radius: 4px;
+            padding: 6px 16px;
+        }
+        QPushButton:hover {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #4C566A, stop:1 #434C5E);
+            border-color: #88C0D0;
+            color: #88C0D0;
+        }
+        QPushButton:pressed {
+            background: #5E81AC;
+            color: #ECEFF4;
+        }
+        QPushButton:default {
+            border: 2px solid #88C0D0;
+        }
+        QPushButton:disabled {
+            background: #3B4252;
+            color: #4C566A;
+            border-color: #3B4252;
+        }
+        QGroupBox {
+            color: #88C0D0;
+            border: 1px solid #434C5E;
+            border-radius: 4px;
+            margin-top: 8px;
+            padding-top: 16px;
+            font-weight: bold;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 4px;
+            color: #88C0D0;
+        }
+        QMenuBar {
+            background-color: #3B4252;
+            color: #E5E9F0;
+            border-bottom: 1px solid #4C566A;
+        }
+        QMenuBar::item:selected {
+            background: #434C5E;
+            color: #88C0D0;
+        }
+        QMenu {
+            background-color: #3B4252;
+            color: #E5E9F0;
+            border: 1px solid #4C566A;
+            border-radius: 4px;
+            padding: 4px;
+        }
+        QMenu::item {
+            padding: 6px 24px;
+            border-radius: 3px;
+        }
+        QMenu::item:selected {
+            background: #5E81AC;
+            color: #ECEFF4;
+        }
+        QMenu::separator {
+            height: 1px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 transparent, stop:0.5 #4C566A, stop:1 transparent);
+            margin: 4px 8px;
+        }
+        QScrollBar:vertical {
+            background: #2E3440;
+            width: 10px;
+            border: none;
+            margin: 0;
+        }
+        QScrollBar::handle:vertical {
+            background: #434C5E;
+            border-radius: 5px;
+            min-height: 20px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: #5E81AC;
+        }
+        QScrollBar::handle:vertical:pressed {
+            background: #88C0D0;
+        }
+        QScrollBar:horizontal {
+            background: #2E3440;
+            height: 10px;
+            border: none;
+            margin: 0;
+        }
+        QScrollBar::handle:horizontal {
+            background: #434C5E;
+            border-radius: 5px;
+            min-width: 20px;
+        }
+        QScrollBar::handle:horizontal:hover {
+            background: #5E81AC;
+        }
+        QScrollBar::handle:horizontal:pressed {
+            background: #88C0D0;
+        }
+        QScrollBar::add-line, QScrollBar::sub-line {
+            height: 0px;
+            width: 0px;
+        }
+        QScrollBar::add-page, QScrollBar::sub-page {
+            background: transparent;
+        }
+        QListWidget {
+            background-color: #2E3440;
+            color: #D8DEE9;
+            border: 1px solid #434C5E;
+            outline: 0;
+        }
+        QListWidget::item:hover {
+            background-color: rgba(136, 192, 208, 0.10);
+        }
+        QListWidget::item:selected {
+            background-color: rgba(136, 192, 208, 0.28);
+            color: #ECEFF4;
+        }
+        QDialog {
+            background-color: #2E3440;
+            color: #D8DEE9;
+        }
+        QLabel {
+            color: #D8DEE9;
+            background: transparent;
+        }
+        QCheckBox, QRadioButton {
+            color: #D8DEE9;
+            spacing: 6px;
+        }
+        QCheckBox::indicator, QRadioButton::indicator {
+            width: 14px;
+            height: 14px;
+        }
+        QCheckBox::indicator:unchecked {
+            background: #3B4252;
+            border: 1px solid #4C566A;
+            border-radius: 3px;
+        }
+        QCheckBox::indicator:checked {
+            background: #88C0D0;
+            border: 1px solid #88C0D0;
+            border-radius: 3px;
+        }
+        QToolTip {
+            background-color: #3B4252;
+            color: #ECEFF4;
+            border: 1px solid #88C0D0;
+            padding: 4px 6px;
+        }
+        QProgressBar {
+            background-color: #3B4252;
+            color: #ECEFF4;
+            border: 1px solid #4C566A;
+            border-radius: 4px;
+            text-align: center;
+            padding: 1px;
+        }
+        QProgressBar::chunk {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #5E81AC, stop:1 #88C0D0);
+            border-radius: 3px;
+        }
+        QProgressDialog {
+            background-color: #2E3440;
+        }
+        QProgressDialog QLabel {
+            color: #E5E9F0;
+            padding: 4px 0;
+        }
+    )";
+    qApp->setStyleSheet(qss);
+}
+
+// 亮色主题：与 applyDarkTheme 对偶
+void MainWindow::applyLightTheme() {
+    QString qss = R"(
+        QMainWindow, QWidget {
+            background-color: #f5f5f5;
+            color: #333333;
+        }
+        QSplitter::handle {
+            background-color: #1976d2;
+            width: 2px;
+        }
+        QToolBar {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #f0f4f8);
+            border-bottom: 2px solid #1976d2;
+            spacing: 4px;
+            padding: 4px;
+        }
+        QToolBar QToolButton {
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 4px;
+            padding: 4px 8px;
+            color: #333333;
+        }
+        QToolBar QToolButton:hover {
+            background: rgba(25, 118, 210, 0.1);
+            border-color: #1976d2;
+            color: #1976d2;
+        }
+        QToolBar QToolButton:pressed {
+            background: rgba(25, 118, 210, 0.2);
+        }
+        QTabWidget::pane {
+            border: 1px solid #e0e0e0;
+            background-color: #ffffff;
+        }
+        QTabBar::tab {
+            background-color: #f5f5f5;
+            color: #666666;
+            padding: 6px 12px;
+            border: 1px solid #e0e0e0;
+            border-bottom: none;
+            margin-right: 2px;
+        }
+        QTabBar::tab:selected {
+            background-color: #ffffff;
+            color: #1976d2;
+            border-bottom: 2px solid #1976d2;
+            font-weight: bold;
+        }
+        QTabBar::tab:hover {
+            background-color: rgba(25, 118, 210, 0.05);
+            color: #333333;
+        }
+        QTreeWidget, QTableWidget {
+            background-color: #ffffff;
+            color: #333333;
+            border: 1px solid #e0e0e0;
+            alternate-background-color: #fafafa;
+            gridline-color: #e0e0e0;
+        }
+        QTreeWidget::item:hover, QTableWidget::item:hover {
+            background-color: rgba(25, 118, 210, 0.05);
+        }
+        QTreeWidget::item:selected, QTableWidget::item:selected {
+            background-color: rgba(25, 118, 210, 0.15);
+            border-left: 3px solid #1976d2;
+            padding-left: 4px;
+            color: #1976d2;
+        }
+        QHeaderView::section {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #f0f4f8);
+            color: #1976d2;
+            border: 1px solid #e0e0e0;
+            padding: 4px 8px;
+            font-weight: bold;
+        }
+        QStatusBar {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #ffffff, stop:1 #f0f4f8);
+            color: #1976d2;
+            border-top: 2px solid #1976d2;
+            padding: 2px;
+        }
+        QStatusBar QLabel {
+            color: #555555;
+            padding: 0 8px;
+        }
+        QLineEdit, QTextEdit, QSpinBox, QComboBox {
+            background-color: #ffffff;
+            color: #333333;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+            padding: 4px 8px;
+        }
+        QLineEdit:focus, QTextEdit:focus {
+            border-color: #1976d2;
+            background-color: #f8fbff;
+        }
+        QPushButton {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #f5f5f5);
+            color: #333333;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+            padding: 6px 16px;
+        }
+        QPushButton:hover {
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #f0f4f8, stop:1 #e3f2fd);
+            border-color: #1976d2;
+            color: #1976d2;
+        }
+        QPushButton:pressed {
+            background-color: rgba(25, 118, 210, 0.2);
+        }
+        QPushButton:default {
+            border: 2px solid #1976d2;
+        }
+        QGroupBox {
+            color: #1976d2;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+            margin-top: 8px;
+            padding-top: 16px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 4px;
+            color: #1976d2;
+        }
+        QMenu {
+            background-color: #ffffff;
+            color: #333333;
+            border: 1px solid #1976d2;
+            border-radius: 4px;
+        }
+        QMenu::item {
+            padding: 6px 24px;
+        }
+        QMenu::item:selected {
+            background-color: rgba(25, 118, 210, 0.15);
+            color: #1976d2;
+        }
+        QMenu::separator {
+            height: 1px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 transparent, stop:0.5 #1976d2, stop:1 transparent);
+            margin: 4px 8px;
+        }
+        QScrollBar:vertical {
+            background: #f5f5f5;
+            width: 10px;
+            border: none;
+        }
+        QScrollBar::handle:vertical {
+            background: #cccccc;
+            border-radius: 5px;
+            min-height: 20px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: #1976d2;
+        }
+        QScrollBar:horizontal {
+            background: #f5f5f5;
+            height: 10px;
+            border: none;
+        }
+        QScrollBar::handle:horizontal {
+            background: #cccccc;
+            border-radius: 5px;
+            min-width: 20px;
+        }
+        QScrollBar::handle:horizontal:hover {
+            background: #1976d2;
+        }
+        QScrollBar::add-line, QScrollBar::sub-line {
+            height: 0px;
+            width: 0px;
+        }
+        QListWidget {
+            background-color: #ffffff;
+            color: #333333;
+            border: 1px solid #e0e0e0;
+        }
+        QListWidget::item:hover {
+            background-color: rgba(25, 118, 210, 0.05);
+        }
+        QListWidget::item:selected {
+            background-color: rgba(25, 118, 210, 0.15);
+            color: #1976d2;
+        }
+        QDialog {
+            background-color: #f5f5f5;
+        }
+        QLabel {
+            color: #333333;
+        }
+    )";
+    qApp->setStyleSheet(qss);
+}

@@ -18,10 +18,10 @@
 *.pdb
 
 # Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
+#*.so
+#*.dylib
+#*.dll
+#*.so.*
 
 
 # Fortran module files
@@ -29,10 +29,10 @@
 *.smod
 
 # Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
+#*.lai
+#*.la
+#*.a
+#*.lib
 
 # Executables
 *.exe
@@ -43,6 +43,7 @@
 build/
 Build/
 build-*/
+cmake-build-debug/
 
 # CMake generated files
 CMakeFiles/
