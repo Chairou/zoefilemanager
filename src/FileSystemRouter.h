@@ -24,6 +24,7 @@
 // =============================================================================
 
 #include "Types.h"
+#include "SmbClient.h"
 #include <QString>
 #include <QVector>
 #include <QStringList>
@@ -48,8 +49,14 @@ public:
      */
     void mount(const QString& mountPrefix, std::unique_ptr<SftpClient> client);
 
-    /// 拆除指定前缀的挂载（未知前缀也安全）；触发 SftpClient 析构 →
-    /// libssh2_session_disconnect + free。
+    /**
+     * 把已认证好的 SMB 会话挂到给定前缀下。
+     * mountPrefix 约定："smb://host/share"（不带末尾 '/'）。
+     * 浏览路径形如 "smb://host/share/<subdir>"。
+     */
+    void mountSmb(const QString& mountPrefix, std::unique_ptr<SmbClient> client);
+
+    /// 拆除指定前缀的挂载（未知前缀也安全）；触发对应 client 析构。
     void unmount(const QString& mountPrefix);
 
     /**
@@ -80,14 +87,22 @@ private:
     FileSystemRouter() = default;
     ~FileSystemRouter();
 
-    /// 路由解析结果。client==nullptr 表示路径走本地；否则 remotePath 是
-    /// 把 mount 前缀从原 path 中剥掉后的"服务器侧绝对路径"。
-    struct Resolved { SftpClient* client; QString remotePath; QString mount; };
+    /// 路由解析结果。
+    ///   - sftp != nullptr  → SFTP 挂载；remotePath 是剥掉 mount 后的服务器侧路径
+    ///   - smb  != nullptr  → SMB 挂载；remotePath 保留完整 "smb://..." URL
+    ///   - 二者都为 nullptr → 本地路径
+    struct Resolved {
+        SftpClient* sftp = nullptr;
+        SmbClient*  smb  = nullptr;
+        QString remotePath;
+        QString mount;
+    };
     Resolved resolve(const QString& path) const;
 
     // 用 std::unordered_map 而不是 QHash —— QHash 的 COW 实现要求 value 可拷贝，
-    // 但 std::unique_ptr<SftpClient> 不可拷贝，会导致编译错误。
+    // 但 std::unique_ptr<...> 不可拷贝，会导致编译错误。
     std::unordered_map<std::string, std::unique_ptr<SftpClient>> m_mounts;
+    std::unordered_map<std::string, std::unique_ptr<SmbClient>>  m_smbMounts;
 };
 
 #endif // FILESYSTEMROUTER_H

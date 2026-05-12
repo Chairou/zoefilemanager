@@ -21,6 +21,18 @@ if(NOT LIBSSH2_INCLUDE_DIR OR NOT LIBSSH2_LIBRARY)
 endif()
 message(STATUS "libssh2: ${LIBSSH2_LIBRARY} (headers: ${LIBSSH2_INCLUDE_DIR})")
 
+# libsmbclient: drives the SMB/Samba browsing in RemoteDialog / SmbClient.
+# On Apple Silicon Homebrew it lives under /opt/homebrew/{include,lib}.
+find_path(LIBSMBCLIENT_INCLUDE_DIR NAMES libsmbclient.h
+    HINTS /opt/homebrew/include /usr/local/include /usr/include)
+find_library(LIBSMBCLIENT_LIBRARY NAMES smbclient libsmbclient
+    HINTS /opt/homebrew/lib /usr/local/lib /usr/lib)
+if(NOT LIBSMBCLIENT_INCLUDE_DIR OR NOT LIBSMBCLIENT_LIBRARY)
+    message(FATAL_ERROR
+        "libsmbclient not found. Install it first, e.g. `brew install samba` on macOS.")
+endif()
+message(STATUS "libsmbclient: ${LIBSMBCLIENT_LIBRARY} (headers: ${LIBSMBCLIENT_INCLUDE_DIR})")
+
 set(SOURCES
     src/main.cpp
     src/MainWindow.cpp
@@ -39,6 +51,7 @@ set(SOURCES
     src/SettingsDialog.cpp
     src/I18n.cpp
     src/AppFonts.cpp
+    src/SmbClient.cpp
 )
 
 set(HEADERS
@@ -58,6 +71,7 @@ set(HEADERS
     src/SettingsDialog.h
     src/I18n.h
     src/AppFonts.h
+    src/SmbClient.h
     src/Types.h
 )
 
@@ -168,9 +182,14 @@ if(APPLE)
     endif()
 endif()
 
-target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Widgets ${LIBSSH2_LIBRARY})
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    Qt6::Widgets
+    ${LIBSSH2_LIBRARY}
+    ${LIBSMBCLIENT_LIBRARY}
+)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${LIBSSH2_INCLUDE_DIR}
+    ${LIBSMBCLIENT_INCLUDE_DIR}
 )

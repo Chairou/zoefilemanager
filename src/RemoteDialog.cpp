@@ -4,6 +4,7 @@
 
 #include "RemoteDialog.h"
 #include "SftpClient.h"
+#include "SmbClient.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -37,7 +38,7 @@ RemoteDialog::RemoteDialog(QWidget* parent)
     m_formLayout = new QFormLayout(m_formGroup);
 
     m_protocolCombo = new QComboBox();
-    m_protocolCombo->addItems({"SFTP", "SSH"});  // SFTP first - it's the data path
+    m_protocolCombo->addItems({"SFTP", "SMB"});  // 去掉 SSH；SMB 是文件共享
     m_formLayout->addRow(QString(), m_protocolCombo);
 
     m_hostInput = new QLineEdit();
@@ -60,11 +61,20 @@ RemoteDialog::RemoteDialog(QWidget* parent)
     m_browseKeyBtn    = new QPushButton();
     keyRow->addWidget(m_keyPathInput);
     keyRow->addWidget(m_browseKeyBtn);
-    m_formLayout->addRow(QString(), keyRow);
+    // 用一个 QWidget 容器包裹 keyRow，方便根据协议整行 show/hide
+    m_keyRowWidget = new QWidget();
+    m_keyRowWidget->setLayout(keyRow);
+    m_formLayout->addRow(QString(), m_keyRowWidget);
 
     m_passphraseInput = new QLineEdit();
     m_passphraseInput->setEchoMode(QLineEdit::Password);
     m_formLayout->addRow(QString(), m_passphraseInput);
+
+    // ---- SMB 字段：Share / Workgroup ----
+    m_shareInput = new QLineEdit();
+    m_formLayout->addRow(QString(), m_shareInput);
+    m_workgroupInput = new QLineEdit();
+    m_formLayout->addRow(QString(), m_workgroupInput);
 
     layout->addWidget(m_formGroup);
 
@@ -89,9 +99,60 @@ RemoteDialog::RemoteDialog(QWidget* parent)
     connect(m_connectBtn,  &QPushButton::clicked,            this, &RemoteDialog::onConnectClicked);
     connect(m_cancelBtn,   &QPushButton::clicked,            this, &QDialog::reject);
     connect(m_browseKeyBtn,&QPushButton::clicked,            this, &RemoteDialog::onBrowseKey);
+    connect(m_protocolCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &RemoteDialog::onProtocolChanged);
 
     connect(&I18n::instance(), &I18n::changed, this, &RemoteDialog::retranslate);
     retranslate();
+    onProtocolChanged(m_protocolCombo->currentIndex());   // 初始化字段可见性+端口
+}
+
+// 协议切换：SFTP 隐藏 Share/Workgroup 字段，显示私钥/passphrase 字段，
+// 默认端口 22；SMB 相反：显示 Share/Workgroup，隐藏私钥/passphrase，默认端口 445。
+void RemoteDialog::onProtocolChanged(int /*index*/) {
+    const QString proto = m_protocolCombo->currentText();
+    const bool isSmb = (proto == "SMB");
+
+    auto showRow = [this](QWidget* field, bool visible) {
+        if (!field) return;
+        field->setVisible(visible);
+        if (auto* lbl = m_formLayout->labelForField(field)) lbl->setVisible(visible);
+    };
+
+    // 私钥/passphrase 仅 SFTP 需要
+    showRow(m_keyRowWidget,    !isSmb);
+    showRow(m_passphraseInput, !isSmb);
+
+    // Share/Workgroup 仅 SMB 需要
+    showRow(m_shareInput,     isSmb);
+    showRow(m_workgroupInput, isSmb);
+
+    // Password 字段的占位提示按协议切换 —— SMB 不支持私钥认证，
+    // 默认情境就是"填密码或匿名/guest"，不应再显示 SFTP 风格的"若使用私钥请留空"。
+    if (m_passwordInput) {
+        m_passwordInput->setPlaceholderText(isSmb
+            ? T("password (leave empty for guest)")
+            : T("leave empty if using a private key"));
+    }
+    // Username placeholder：SMB 在企业 AD 域里常常要 DOMAIN\user 或 user@domain
+    if (m_usernameInput) {
+        m_usernameInput->setPlaceholderText(isSmb
+            ? T("username (try DOMAIN\\\\user or user@domain in AD environments)")
+            : T("username"));
+    }
+    // Workgroup placeholder：企业域时填大写域名，家用留空
+    if (m_workgroupInput) {
+        m_workgroupInput->setPlaceholderText(
+            T("home/SOHO: leave empty; corporate AD: enter your domain (e.g. TENCENT)"));
+    }
+
+    // 协议对应默认端口（仅当当前端口仍是上一协议的默认值时才替换，避免
+    // 覆盖用户手动输入的自定义端口）
+    if (isSmb && (m_portSpin->value() == 22 || m_portSpin->value() == 0)) {
+        m_portSpin->setValue(445);
+    } else if (!isSmb && (m_portSpin->value() == 445)) {
+        m_portSpin->setValue(22);
+    }
 }
 
 RemoteDialog::~RemoteDialog() {
@@ -118,8 +179,9 @@ void RemoteDialog::setupSavedConnections() {
     m_savedConnections.append(staging);
 
     RemoteConnection dev;
-    dev.name = "Dev Server"; dev.protocol = "SSH";
-    dev.host = "dev.example.com"; dev.port = 2222; dev.username = "developer";
+    dev.name = "File Server"; dev.protocol = "SMB";
+    dev.host = "fileserver.example.com"; dev.port = 445; dev.username = "guest";
+    dev.share = "Public";
     m_savedConnections.append(dev);
 
     for (const auto& conn : m_savedConnections) {
@@ -138,6 +200,8 @@ void RemoteDialog::onSavedConnectionClicked(QListWidgetItem* item) {
     m_portSpin->setValue(conn.port);
     m_usernameInput->setText(conn.username);
     m_passwordInput->clear();
+    if (m_shareInput)     m_shareInput->setText(conn.share);
+    if (m_workgroupInput) m_workgroupInput->setText(conn.workgroup);
 }
 
 void RemoteDialog::onBrowseKey() {
@@ -164,19 +228,18 @@ void RemoteDialog::retranslate() {
     setFormLabel(m_usernameInput,   T("Username:"));
     setFormLabel(m_passwordInput,   T("Password:"));
     setFormLabel(m_passphraseInput, T("Key passphrase:"));
-    // keyRow 是 QHBoxLayout：通过其中一个子控件的 parentLayout 不好定位，
-    // 索性按行号取（Private key 那行是第 6 行，index=5）
-    if (auto* w = m_formLayout->itemAt(5, QFormLayout::LabelRole)) {
-        if (auto* lbl = qobject_cast<QLabel*>(w->widget())) {
-            lbl->setText(T("Private key:"));
-        }
-    }
+    if (m_shareInput)     setFormLabel(m_shareInput,     T("Share:"));
+    if (m_workgroupInput) setFormLabel(m_workgroupInput, T("Workgroup:"));
+    // keyRow 是 QWidget 容器：找它的 label
+    if (m_keyRowWidget) setFormLabel(m_keyRowWidget, T("Private key:"));
 
     m_hostInput->setPlaceholderText(T("hostname or IP"));
     m_usernameInput->setPlaceholderText(T("username"));
     m_passwordInput->setPlaceholderText(T("leave empty if using a private key"));
     m_keyPathInput->setPlaceholderText(T("optional, e.g. ~/.ssh/id_rsa"));
     m_passphraseInput->setPlaceholderText(T("only if the key is encrypted"));
+    if (m_shareInput)     m_shareInput->setPlaceholderText(T("share name, e.g. Public"));
+    if (m_workgroupInput) m_workgroupInput->setPlaceholderText(T("optional Windows workgroup/domain"));
 
     m_browseKeyBtn->setText(T("Browse…"));
     m_cancelBtn->setText(T("Cancel"));
@@ -185,6 +248,10 @@ void RemoteDialog::retranslate() {
     if (m_statusIsReady) {
         m_statusLabel->setText(T("Ready."));
     }
+
+    // 语言切换可能把"按协议定制"的占位符（密码框）覆盖回 SFTP 文案，
+    // 这里再触发一次协议联动复位。
+    if (m_protocolCombo) onProtocolChanged(m_protocolCombo->currentIndex());
 }
 
 void RemoteDialog::setBusy(bool busy) {
@@ -223,6 +290,8 @@ void RemoteDialog::onConnectClicked() {
     conn.password       = m_passwordInput->text();
     conn.privateKeyPath = m_keyPathInput->text().trimmed();
     conn.passphrase     = m_passphraseInput->text();
+    if (m_shareInput)     conn.share     = m_shareInput->text().trimmed();
+    if (m_workgroupInput) conn.workgroup = m_workgroupInput->text().trimmed();
 
     // Expand a leading "~" so users can type "~/.ssh/id_rsa".
     if (conn.privateKeyPath.startsWith("~/")) {
@@ -237,6 +306,49 @@ void RemoteDialog::onConnectClicked() {
         QMessageBox::warning(this, T("Missing user"), T("Please enter a username."));
         m_usernameInput->setFocus(); return;
     }
+
+    // SMB 分支：用 libsmbclient 真实连接
+    if (conn.protocol == "SMB") {
+        if (conn.share.isEmpty()) {
+            QMessageBox::warning(this, T("Missing share"),
+                T("Please enter the SMB share name (e.g. Public)."));
+            if (m_shareInput) m_shareInput->setFocus();
+            return;
+        }
+
+        setBusy(true);
+        m_statusIsReady = false;
+        m_statusLabel->setStyleSheet("color: #888;");
+        m_statusLabel->setText(T("Connecting to %1@%2:%3 …")
+            .arg(conn.username, conn.host).arg(conn.port));
+        QApplication::processEvents();
+
+        auto smb = std::make_unique<SmbClient>();
+        bool smbOk = smb->connectAndAuth(conn);
+        setBusy(false);
+
+        if (!smbOk) {
+            m_statusLabel->setStyleSheet("color: #c0392b;");
+            m_statusLabel->setText("✗ " + smb->lastError());
+            QMessageBox::critical(this, T("Connection failed"), smb->lastError());
+            return;
+        }
+
+        if (conn.name.isEmpty()) {
+            conn.name = QString("%1@%2/%3").arg(conn.username, conn.host, conn.share);
+        }
+        m_lastConnected = conn;
+        m_smbClient = std::move(smb);
+        m_statusLabel->setStyleSheet("color: #27ae60;");
+        m_statusLabel->setText(QString("✓ Connected: smb://%1/%2")
+            .arg(conn.host, conn.share));
+
+        emit connectRequested(conn);
+        accept();
+        return;
+    }
+
+    // 以下是 SFTP 分支
     if (conn.password.isEmpty() && conn.privateKeyPath.isEmpty()) {
         QMessageBox::warning(this, T("Missing credentials"),
             T("Provide a password, a private key, or both."));
@@ -291,4 +403,8 @@ RemoteConnection RemoteDialog::getConnection() const {
 
 std::unique_ptr<SftpClient> RemoteDialog::takeClient() {
     return std::move(m_client);
+}
+
+std::unique_ptr<SmbClient> RemoteDialog::takeSmbClient() {
+    return std::move(m_smbClient);
 }

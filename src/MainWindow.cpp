@@ -12,6 +12,7 @@
 #include "SearchDialog.h"
 #include "RemoteDialog.h"
 #include "SftpClient.h"
+#include "SmbClient.h"
 #include "FileSystemRouter.h"
 #include "ScriptDialog.h"
 #include "RealFileSystem.h"
@@ -1594,28 +1595,45 @@ void MainWindow::onRemoteConnect() {
     if (dlg.exec() != QDialog::Accepted || !succeeded) {
         return;  // user cancelled, or connect failed (dialog already showed why)
     }
-    auto client = dlg.takeClient();
-    if (!client) {
-        statusBar()->showMessage("Internal error: no live session handed off", 3000);
-        return;
-    }
 
-    // Build a mount prefix and register the live session with the router so
-    // every panel / tree listing that walks into this URL goes over SFTP.
-    const QString mount = QString("sftp://%1@%2:%3")
-        .arg(accepted.username, accepted.host).arg(accepted.port);
-
-    // If there's a stale mount at the same prefix (reconnect), drop it first
-    // so the old session is torn down deterministically.
-    if (!m_remoteMountPrefix.isEmpty()) {
-        FileSystemRouter::instance().unmount(m_remoteMountPrefix);
+    QString mount;
+    if (accepted.protocol == "SMB") {
+        // ---- SMB 分支：从 dialog 拿走活 SmbClient，挂到 router ----
+        auto smbClient = dlg.takeSmbClient();
+        if (!smbClient) {
+            statusBar()->showMessage("Internal error: no live SMB session handed off", 3000);
+            return;
+        }
+        // 挂载前缀约定："smb://host/<share-percent-encoded>"。浏览路径 = mount + "/<subdir>"。
+        // 关键：share 可能含中文（如 "tfs/文体协会/腾讯电影协会-影音博物馆"），
+        // 必须做 percent-encoding，确保和 SmbClient::listDirectory 返回的
+        // entry.path（也是 percent-encoded）使用同一种字面，否则后续浏览
+        // 时 FileSystemRouter::resolve(path) 因 startsWith(prefix) 不匹配
+        // 会路由到 RealFileSystem，导致子目录列表为空。
+        mount = SmbClient::buildUrl(accepted.host, accepted.share);
+        if (!m_remoteMountPrefix.isEmpty()) {
+            FileSystemRouter::instance().unmount(m_remoteMountPrefix);
+        }
+        FileSystemRouter::instance().mountSmb(mount, std::move(smbClient));
+    } else {
+        // ---- SFTP 分支（保留原行为）----
+        auto client = dlg.takeClient();
+        if (!client) {
+            statusBar()->showMessage("Internal error: no live session handed off", 3000);
+            return;
+        }
+        mount = QString("sftp://%1@%2:%3")
+            .arg(accepted.username, accepted.host).arg(accepted.port);
+        if (!m_remoteMountPrefix.isEmpty()) {
+            FileSystemRouter::instance().unmount(m_remoteMountPrefix);
+        }
+        FileSystemRouter::instance().mount(mount, std::move(client));
     }
-    FileSystemRouter::instance().mount(mount, std::move(client));
     m_remoteMountPrefix = mount;
 
     m_isRemoteConnected = true;
     // Navigate the active panel into the remote root. The router will
-    // transparently serve the directory listing over SFTP.
+    // transparently serve the directory listing over SFTP / SMB.
     activePanel()->navigateTo(mount + "/");
     m_remoteConnectAction->setEnabled(false);
     m_remoteDisconnectAction->setEnabled(true);

@@ -11,47 +11,42 @@
 #include "FileSystemRouter.h"
 #include "RealFileSystem.h"
 #include "SftpClient.h"
+#include "SmbClient.h"
 
 FileSystemRouter& FileSystemRouter::instance() {
     static FileSystemRouter inst;
     return inst;
 }
 
-// ---------------------------------------------------------------------------
-// 析构 —— 只在进程退出时被静态终结器调用。
-//
-// 关键：进入这里时 libssh2 / libcrypto 可能已经被 dyld 卸载了
-// （C++ 静态析构顺序 vs dylib 卸载顺序在 macOS 上不保证）。
-// 此时调用 libssh2_session_free / libssh2_sftp_shutdown 会陷入 OpenSSL，
-// 触发 pthread_rwlock_rdlock(NULL) → SIGSEGV（曾在崩溃报告中实际发生）。
-//
-// 所以这里只翻一个全局 shutdown 标志，让 SftpClient 析构降级为
-// 仅 close socket，不再调任何 libssh2 API。完整的"优雅再见"必须由
-// 应用调用 clear() 主动完成（在 Qt 还活着的时候）。
-// ---------------------------------------------------------------------------
 FileSystemRouter::~FileSystemRouter() {
     SftpClient::markShuttingDown();
     m_mounts.clear();
+    m_smbMounts.clear();
 }
 
-// 安全的拆挂载路径：MainWindow 析构 / aboutToQuit 调用，此时
-// libssh2/libcrypto 还活着，unique_ptr 析构链会走完整流程。
 void FileSystemRouter::clear() {
     m_mounts.clear();
+    m_smbMounts.clear();
 }
 
 void FileSystemRouter::mount(const QString& mountPrefix,
                              std::unique_ptr<SftpClient> client) {
-    // 同前缀已挂会被替换 —— 老的 unique_ptr 立刻析构，干净拆掉旧会话
     m_mounts[mountPrefix.toStdString()] = std::move(client);
+}
+
+void FileSystemRouter::mountSmb(const QString& mountPrefix,
+                                std::unique_ptr<SmbClient> client) {
+    m_smbMounts[mountPrefix.toStdString()] = std::move(client);
 }
 
 void FileSystemRouter::unmount(const QString& mountPrefix) {
     m_mounts.erase(mountPrefix.toStdString());
+    m_smbMounts.erase(mountPrefix.toStdString());
 }
 
 bool FileSystemRouter::isRemote(const QString& path) const {
-    return resolve(path).client != nullptr;
+    Resolved r = resolve(path);
+    return r.sftp != nullptr || r.smb != nullptr;
 }
 
 QString FileSystemRouter::mountFor(const QString& path) const {
@@ -59,58 +54,82 @@ QString FileSystemRouter::mountFor(const QString& path) const {
 }
 
 // ---------------------------------------------------------------------------
-// 路径解析 —— 找出最长匹配的挂载前缀，并把"服务器侧绝对路径"剥出来。
-//
-// 输入示例 / 输出示例：
-//   "/Users/foo"                      → {nullptr, "/Users/foo", ""}
-//   "sftp://demo@h:22/"               → {client*, "/",          "sftp://demo@h:22"}
-//   "sftp://demo@h:22/pub/example"    → {client*, "/pub/example", "sftp://demo@h:22"}
+// 路径解析 —— SFTP 挂载剥前缀后是服务器侧路径；
+// SMB 挂载保留完整 URL，因为 libsmbclient API 直接吃 "smb://host/share/..."。
 // ---------------------------------------------------------------------------
 FileSystemRouter::Resolved FileSystemRouter::resolve(const QString& path) const {
-    // 最长前缀匹配；挂载数量极小（实际就 0 或 1 个），线性扫描没问题。
     QString      bestMount;
-    SftpClient*  bestClient = nullptr;
+    SftpClient*  bestSftp  = nullptr;
+    SmbClient*   bestSmb   = nullptr;
+
     for (auto it = m_mounts.begin(); it != m_mounts.end(); ++it) {
         const QString prefix = QString::fromStdString(it->first);
         if (path == prefix || path.startsWith(prefix + "/")) {
             if (prefix.size() > bestMount.size()) {
-                bestMount  = prefix;
-                bestClient = it->second.get();
+                bestMount = prefix;
+                bestSftp  = it->second.get();
+                bestSmb   = nullptr;
             }
         }
     }
-    if (!bestClient) return {nullptr, path, QString()};
+    for (auto it = m_smbMounts.begin(); it != m_smbMounts.end(); ++it) {
+        const QString prefix = QString::fromStdString(it->first);
+        if (path == prefix || path.startsWith(prefix + "/")) {
+            if (prefix.size() > bestMount.size()) {
+                bestMount = prefix;
+                bestSmb   = it->second.get();
+                bestSftp  = nullptr;
+            }
+        }
+    }
 
-    // 剥前缀，确保 remote 至少是 "/"
-    QString remote = path.mid(bestMount.size());
-    if (remote.isEmpty()) remote = "/";
-    if (!remote.startsWith('/')) remote.prepend('/');
-    return {bestClient, remote, bestMount};
+    if (!bestSftp && !bestSmb) return {nullptr, nullptr, path, QString()};
+
+    if (bestSftp) {
+        QString remote = path.mid(bestMount.size());
+        if (remote.isEmpty()) remote = "/";
+        if (!remote.startsWith('/')) remote.prepend('/');
+        return {bestSftp, nullptr, remote, bestMount};
+    }
+    // SMB：保留完整 URL 作为 remotePath
+    return {nullptr, bestSmb, path, bestMount};
 }
 
 // ---------------------------------------------------------------------------
-// 列目录 —— 远程后端返回的 FileEntry 里 path 是"服务器侧绝对路径"，
-// 这里再加回 mount 前缀，让 UI 看到的路径形式始终是一致的"sftp://...全路径"。
+// 列目录
 // ---------------------------------------------------------------------------
 QVector<FileEntry> FileSystemRouter::listDirectory(const QString& path) {
     Resolved r = resolve(path);
-    if (r.client) {
-        auto entries = r.client->listDirectory(r.remotePath);
+    if (r.sftp) {
+        auto entries = r.sftp->listDirectory(r.remotePath);
         for (auto& e : entries) {
-            e.path = r.mount + e.path;     // 还原成 "sftp://user@host:22/foo"
+            e.path = r.mount + e.path;
         }
         return entries;
+    }
+    if (r.smb) {
+        // SMB 的 listDirectory 已返回完整 smb:// URL，无需拼接
+        return r.smb->listDirectory(r.remotePath);
     }
     return RealFileSystem::instance().listDirectory(path);
 }
 
 QStringList FileSystemRouter::getSubDirectories(const QString& path) {
     Resolved r = resolve(path);
-    if (r.client) {
-        QStringList remoteDirs = r.client->listSubdirectories(r.remotePath);
+    if (r.sftp) {
+        QStringList remoteDirs = r.sftp->listSubdirectories(r.remotePath);
         QStringList out;
         out.reserve(remoteDirs.size());
         for (const auto& d : remoteDirs) out.append(r.mount + d);
+        return out;
+    }
+    if (r.smb) {
+        // 简单做法：调 listDirectory 然后过滤目录
+        auto entries = r.smb->listDirectory(r.remotePath);
+        QStringList out;
+        for (const auto& e : entries) {
+            if (e.isDirectory) out.append(e.path);
+        }
         return out;
     }
     return RealFileSystem::instance().getSubDirectories(path);
@@ -118,33 +137,62 @@ QStringList FileSystemRouter::getSubDirectories(const QString& path) {
 
 bool FileSystemRouter::isDirectory(const QString& path) {
     Resolved r = resolve(path);
-    if (r.client) return r.client->isDirectory(r.remotePath);
+    if (r.sftp) return r.sftp->isDirectory(r.remotePath);
+    if (r.smb) {
+        // 通过父目录 listDirectory + 名称匹配判断（避免给 SmbClient 加新方法）
+        int slash = path.lastIndexOf('/');
+        if (slash < 0) return false;
+        QString parent = path.left(slash);
+        QString name   = path.mid(slash + 1);
+        auto entries = r.smb->listDirectory(parent);
+        for (const auto& e : entries) {
+            if (e.name == name) return e.isDirectory;
+        }
+        return false;
+    }
     return RealFileSystem::instance().isDirectory(path);
 }
 
 bool FileSystemRouter::exists(const QString& path) {
     Resolved r = resolve(path);
-    if (r.client) return r.client->exists(r.remotePath);
+    if (r.sftp) return r.sftp->exists(r.remotePath);
+    if (r.smb) {
+        // 同 isDirectory 思路
+        if (path == r.mount) return true;   // 挂载根本身视为存在
+        int slash = path.lastIndexOf('/');
+        if (slash < 0) return false;
+        QString parent = path.left(slash);
+        QString name   = path.mid(slash + 1);
+        auto entries = r.smb->listDirectory(parent);
+        for (const auto& e : entries) {
+            if (e.name == name) return true;
+        }
+        return false;
+    }
     return RealFileSystem::instance().exists(path);
 }
 
-// 路径规整：本地用 QDir::cleanPath；远程则只折叠重复的 "//"，
-// 不能用 QDir::cleanPath 因为它会把 "sftp://..." 折成 "sftp:/..."（破坏 URL）。
 QString FileSystemRouter::normalizePath(const QString& path) const {
     Resolved r = resolve(path);
-    if (r.client) {
+    if (r.sftp) {
         QString remote = r.remotePath;
         while (remote.contains("//")) remote.replace("//", "/");
         if (remote.isEmpty()) remote = "/";
         return r.mount + remote;
     }
+    if (r.smb) {
+        // SMB 路径不能破坏 smb:// 这种双斜杠头
+        QString rest = path.mid(QStringLiteral("smb://").size());
+        while (rest.contains("//")) rest.replace("//", "/");
+        return "smb://" + rest;
+    }
     return RealFileSystem::instance().normalizePath(path);
 }
 
-// 隐藏文件开关广播到所有后端，UI 只需调用一次本方法
 void FileSystemRouter::setShowHidden(bool show) {
     RealFileSystem::instance().setShowHidden(show);
     for (auto it = m_mounts.begin(); it != m_mounts.end(); ++it) {
         it->second->setShowHidden(show);
     }
+    // SmbClient 暂未提供 setShowHidden（隐藏文件在 SMB 里少见）；预留扩展。
 }

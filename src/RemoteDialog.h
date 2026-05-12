@@ -20,6 +20,7 @@
 
 #include "Types.h"
 #include "I18n.h"
+#include "SmbClient.h"
 #include <QDialog>
 #include <QLineEdit>
 #include <QSpinBox>
@@ -45,8 +46,11 @@ public:
     RemoteConnection getConnection() const;
 
     /// 把已登录成功的活会话交给调用方（move 语义）。
-    /// 调用方负责保管、最终 disconnect。
+    /// SFTP 协议成功时有效；否则返回 nullptr。
     std::unique_ptr<SftpClient> takeClient();
+
+    /// 若本次连接是 SMB 协议，返回活 SmbClient；否则返回 nullptr。
+    std::unique_ptr<SmbClient>  takeSmbClient();
 
 signals:
     /// 仅在真实登录成功后发出（与"用户点 Connect 但失败"严格区分）
@@ -56,6 +60,7 @@ private slots:
     void onSavedConnectionClicked(QListWidgetItem* item);  // 点已保存条目 → 填表
     void onConnectClicked();                                // 校验 + 真实拨号
     void onBrowseKey();                                     // 弹文件选择器选私钥
+    void onProtocolChanged(int index);                      // 协议切换 → 隐藏/显示 SMB/SSH-only 字段 + 默认端口
     void retranslate();                                     // 语言切换时刷新所有可见文本
 
 private:
@@ -79,6 +84,10 @@ private:
     QLineEdit*   m_keyPathInput;
     QPushButton* m_browseKeyBtn;
     QLineEdit*   m_passphraseInput;
+    // SMB 专属字段 —— 选 SMB 时显示，选 SFTP 时隐藏
+    QLineEdit*   m_shareInput = nullptr;
+    QLineEdit*   m_workgroupInput = nullptr;
+    class QWidget* m_keyRowWidget = nullptr;  // 整行容器（SFTP 时可见、SMB 时隐藏）
     QPushButton* m_connectBtn;
     QPushButton* m_cancelBtn;
     QLabel*      m_statusLabel;          // 显示进度/错误/指纹
@@ -86,7 +95,8 @@ private:
 
     QVector<RemoteConnection> m_savedConnections;     // 内置示例
     RemoteConnection          m_lastConnected;        // 登录成功的那次
-    std::unique_ptr<SftpClient> m_client;             // 活会话，等 takeClient
+    std::unique_ptr<SftpClient> m_client;             // SFTP 活会话，等 takeClient
+    std::unique_ptr<SmbClient>  m_smbClient;          // SMB 活会话，等 takeSmbClient
     bool                      m_cursorOverridden = false;  // 光标 push/pop 守门
 };
 

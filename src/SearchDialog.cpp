@@ -12,17 +12,26 @@
 SearchDialog::SearchDialog(const QString& currentPath, QWidget* parent)
     : QDialog(parent)
 {
-    setMinimumSize(500, 400);
+    setMinimumSize(720, 500);
+    resize(900, 600);
 
     auto* layout = new QVBoxLayout(this);
 
     auto* formLayout = new QFormLayout();
+    // 让 field 列跟随对话框宽度铺满（默认是 FieldsStayAtSizeHint，会偏窄）
+    formLayout->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    formLayout->setRowWrapPolicy(QFormLayout::DontWrapRows);
+    formLayout->setHorizontalSpacing(8);
 
     m_queryInput = new QLineEdit();
+    m_queryInput->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    m_queryInput->setMinimumHeight(28);
     m_searchLabel = new QLabel();
     formLayout->addRow(m_searchLabel, m_queryInput);
 
     m_pathInput = new QLineEdit(currentPath);
+    m_pathInput->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    m_pathInput->setMinimumHeight(28);
     m_pathLabel = new QLabel();
     formLayout->addRow(m_pathLabel, m_pathInput);
 

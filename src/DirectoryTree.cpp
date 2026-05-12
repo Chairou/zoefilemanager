@@ -285,12 +285,23 @@ void DirectoryTree::revealPath(const QString& path) {
     // 为什么放在 singleShot(0) 里：scrollToItem 触发水平滚动条
     // AsNeeded 的出现/隐藏会改变 viewport 高度 → 触发布局。延迟到下一轮
     // 事件循环可以让布局稳定，visualRect / hbar->maximum() 返回最终值。
-    QTimer::singleShot(0, this, [this, item]() {
-        QModelIndex idx = indexFromItem(item, 0);
+    //
+    // **重要：lambda 里不可以捕获 QTreeWidgetItem* —— 那个 item 可能在
+    // 下一帧执行前因 lazyPopulate / rebuild / 节点删除等原因被销毁，
+    // 触发 EXC_BAD_ACCESS（曾在崩溃报告中 indexFromItem(野指针) → SIGSEGV）。
+    // 改捕 path 字符串，回调里通过 m_pathToItem.find(path) 重新查找当前
+    // 仍存活的 item；找不到就静默返回。**
+    QTimer::singleShot(0, this, [this, path]() {
+        auto it = m_pathToItem.find(path);
+        if (it == m_pathToItem.end()) return;
+        QTreeWidgetItem* freshItem = it.value();
+        if (!freshItem) return;
+
+        QModelIndex idx = indexFromItem(freshItem, 0);
         if (!idx.isValid()) return;
 
         // 第 1 步：再次强制垂直居中（+ Qt 内部的水平可见调整）。
-        scrollToItem(item, QAbstractItemView::PositionAtCenter);
+        scrollToItem(freshItem, QAbstractItemView::PositionAtCenter);
 
         // 第 2 步：用 setValue 覆盖 Qt 的水平定位，做真·水平居中。
         auto* hbar = horizontalScrollBar();
@@ -299,7 +310,7 @@ void DirectoryTree::revealPath(const QString& path) {
         QRect vr = visualRect(idx);
         const int textStartX = vr.left();
         const int textPixWidth =
-            fontMetrics().horizontalAdvance(item->text(0)) + 24;
+            fontMetrics().horizontalAdvance(freshItem->text(0)) + 24;
         const int itemCenterInViewport = textStartX + textPixWidth / 2;
         const int viewportW = viewport()->width();
         const int delta = itemCenterInViewport - viewportW / 2;

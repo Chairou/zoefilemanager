@@ -93,7 +93,7 @@ struct ClipboardData {
  */
 struct RemoteConnection {
     QString name;                   // 用户给这条连接起的别名（保存连接时用）
-    QString protocol;               // "SFTP" / "SSH"
+    QString protocol;               // "SFTP" / "SMB"
     QString host;
     int port = 22;
     QString username;
@@ -101,6 +101,9 @@ struct RemoteConnection {
     QString privateKeyPath;         // 可选：私钥文件路径，给了就优先用公钥
     QString passphrase;             // 可选：私钥的 passphrase
     QString fingerprint;            // 登录成功后回填（SHA256）
+    // ---- SMB 专用 ----
+    QString share;                  // SMB 共享名（如 "Public"）。SFTP 忽略。
+    QString workgroup;              // 可选：Windows 工作组/域名。SFTP 忽略。
 };
 
 /**
