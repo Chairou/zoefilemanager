@@ -22,6 +22,7 @@
 #include <QMimeData>
 #include <QUrl>
 #include <QStringList>
+#include <QByteArray>
 
 // 同应用 drag-and-drop 的私有 MIME 类型，用于"线分隔的路径列表"，UTF-8。
 // 同时也支持 SFTP URL（标准 text/uri-list 不能表示 sftp://）。
@@ -418,6 +419,8 @@ void FilePanel::syncPathUI(int tabIndex, const QString& canonicalPath) {
 // 根目录 → "/"；其它路径取末段 basename。
 // - 去掉尾随斜杠（"/Users/chairou/" → "chairou"）
 // - 远程挂载根（"sftp://user@host:22/"）保留为 "/"（再细分没意义）
+// - 末段若是 percent-encoded（SMB URL 常见 %E6%96%87...）按 UTF-8 反解为中文
+// - 超长末段做居中省略（"开头…结尾"），防止 tab 被撑爆
 QString FilePanel::titleFromPath(const QString& path) {
     if (path.isEmpty() || path == "/") return QStringLiteral("/");
 
@@ -428,9 +431,23 @@ QString FilePanel::titleFromPath(const QString& path) {
     if (p.isEmpty()) return QStringLiteral("/");
 
     const int slash = p.lastIndexOf('/');
-    if (slash < 0) return p;                           // 没斜杠，整串当标题
-    const QString tail = p.mid(slash + 1);
+    QString tail = (slash < 0) ? p : p.mid(slash + 1);
     if (tail.isEmpty()) return QStringLiteral("/");    // 极端兜底
+
+    // percent-decode（SMB URL 的 %E6%96%87 → 中文字符）。
+    // 对已经是纯 ASCII 的段无副作用；对本地路径也安全（本地很少出现 % 字面）。
+    if (tail.contains('%')) {
+        const QByteArray decoded =
+            QByteArray::fromPercentEncoding(tail.toUtf8());
+        const QString asUtf8 = QString::fromUtf8(decoded);
+        if (!asUtf8.isEmpty()) tail = asUtf8;
+    }
+
+    // 长度兜底：超过 24 字符做居中省略（"前 12…后 10"），防止 tab 被撑爆。
+    constexpr int kMaxTabChars = 24;
+    if (tail.size() > kMaxTabChars) {
+        tail = tail.left(12) + QStringLiteral("…") + tail.right(10);
+    }
     return tail;
 }
 

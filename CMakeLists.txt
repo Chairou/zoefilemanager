@@ -166,11 +166,22 @@ if(APPLE)
             # ERROR lines about optional Qt modules NOT used by this app
             # (QtPdf, QtVirtualKeyboard, etc. dragged in by plugin scans)
             # never abort the whole build.
+            #
+            # macdeployqt in brew-Qt 6.x doesn't expose -exclude-plugins, so we:
+            #   (a) filter known-benign rpath ERRORs from its stderr to keep
+            #       the build log clean, and
+            #   (b) right after macdeployqt finishes, delete the unused
+            #       plugins it copied in (libqpdf, libqtvirtualkeyboardplugin)
+            #       so the bundle doesn't carry dead-link dylibs at runtime.
             add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E echo
                     "Running macdeployqt (non-fatal: optional-module rpath warnings are expected)"
                 COMMAND sh -c
-                    "'${MACDEPLOYQT_EXECUTABLE}' '$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>' -verbose=1 -no-strip '-codesign=-' || echo 'macdeployqt reported errors; continuing — final sign happens in deploy_macos.cmake'"
+                    "{ '${MACDEPLOYQT_EXECUTABLE}' '$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>' -verbose=1 -no-strip '-codesign=-' 2>&1 || echo 'macdeployqt reported errors; continuing — final sign happens in deploy_macos.cmake'; } | grep -v -E 'Cannot resolve rpath \"@rpath/Qt(Pdf|VirtualKeyboard|VirtualKeyboardQml)\\.framework' | grep -v -E '^ERROR:  using QList\\(\"/opt/homebrew' || true"
+                COMMAND sh -c
+                    "rm -f '$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/PlugIns/imageformats/libqpdf.dylib' '$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/PlugIns/platforminputcontexts/libqtvirtualkeyboardplugin.dylib' && rmdir '$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/PlugIns/platforminputcontexts' 2>/dev/null; true"
+                COMMAND ${CMAKE_COMMAND} -E echo
+                    "Pruned unused Qt plugins (libqpdf, libqtvirtualkeyboardplugin)"
                 COMMAND ${CMAKE_COMMAND}
                     -DBUNDLE=$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>
                     -DLIBSSH2_SRC=${LIBSSH2_LIBRARY}

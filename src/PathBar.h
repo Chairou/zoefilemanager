@@ -24,6 +24,7 @@ class QLabel;
 class QTimer;
 class QLineEdit;
 class QStackedLayout;
+class QScrollArea;
 
 class PathBar : public QWidget {
     Q_OBJECT
@@ -59,11 +60,12 @@ private:
     // ---- 只读显示页面 ----
     QWidget* m_displayPage = nullptr;
     QHBoxLayout* m_layout = nullptr;
-    // 面包屑模式下此 label 隐藏（仅在远程 URL 时显示整条路径）
-    QPushButton* m_pathLabel = nullptr;
-    // 面包屑容器（内部由 rebuildDisplay 每次重建）
+    // 旧的"远程 URL fallback" QLabel，现在被面包屑替代 —— 隐藏保留，未来可清理
+    QLabel* m_pathLabel = nullptr;
+    // 面包屑容器（内部由 rebuildDisplay 每次重建）+ 水平滚动壳
     QWidget* m_crumbHost = nullptr;
     QHBoxLayout* m_crumbLayout = nullptr;
+    QScrollArea* m_crumbScroll = nullptr;      // 横向滚动壳，容长路径不撑窗
     QPushButton* m_editBtn = nullptr;    // "✎" 按钮 —— 切换到编辑模式
 
     // ---- 编辑页面 ----
