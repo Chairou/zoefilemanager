@@ -41,44 +41,65 @@ RemoteDialog::RemoteDialog(QWidget* parent)
     m_formLayout->setFormAlignment(Qt::AlignLeft | Qt::AlignTop);
     m_formLayout->setRowWrapPolicy(QFormLayout::DontWrapRows);
 
+    // ---- 统一所有输入字段的宽度，与 SFTP/SMB 下拉框对齐 ----
+    // 设计：所有输入控件（QLineEdit/QSpinBox/含按钮的复合行）都使用同一固定宽度，
+    //      让"连接信息"区块视觉上是一根整齐对齐的列。
+    constexpr int kFieldWidth = 200;   // = m_protocolCombo 的宽度
+    auto fixWidth = [](QWidget* w) {
+        w->setMinimumWidth(kFieldWidth);
+        w->setMaximumWidth(kFieldWidth);
+    };
+
     m_protocolCombo = new QComboBox();
     m_protocolCombo->addItems({"SFTP", "SMB"});  // 去掉 SSH；SMB 是文件共享
-    m_protocolCombo->setMinimumWidth(200);  // UI: 协议下拉框宽度 ×2
+    fixWidth(m_protocolCombo);
     m_formLayout->addRow(QString(), m_protocolCombo);
 
     m_hostInput = new QLineEdit();
+    fixWidth(m_hostInput);
     m_formLayout->addRow(QString(), m_hostInput);
 
     m_portSpin = new QSpinBox();
     m_portSpin->setRange(1, 65535);
     m_portSpin->setValue(22);
+    fixWidth(m_portSpin);
     m_formLayout->addRow(QString(), m_portSpin);
 
     m_usernameInput = new QLineEdit();
+    fixWidth(m_usernameInput);
     m_formLayout->addRow(QString(), m_usernameInput);
 
     m_passwordInput = new QLineEdit();
     m_passwordInput->setEchoMode(QLineEdit::Password);
+    fixWidth(m_passwordInput);
     m_formLayout->addRow(QString(), m_passwordInput);
 
     auto* keyRow      = new QHBoxLayout();
+    keyRow->setContentsMargins(0, 0, 0, 0);
+    keyRow->setSpacing(4);
     m_keyPathInput    = new QLineEdit();
     m_browseKeyBtn    = new QPushButton();
+    // keyRow 整行 = kFieldWidth：浏览按钮固定 24px，输入框占剩余
+    m_browseKeyBtn->setFixedWidth(24);
     keyRow->addWidget(m_keyPathInput);
     keyRow->addWidget(m_browseKeyBtn);
     // 用一个 QWidget 容器包裹 keyRow，方便根据协议整行 show/hide
     m_keyRowWidget = new QWidget();
     m_keyRowWidget->setLayout(keyRow);
+    fixWidth(m_keyRowWidget);
     m_formLayout->addRow(QString(), m_keyRowWidget);
 
     m_passphraseInput = new QLineEdit();
     m_passphraseInput->setEchoMode(QLineEdit::Password);
+    fixWidth(m_passphraseInput);
     m_formLayout->addRow(QString(), m_passphraseInput);
 
     // ---- SMB 字段：Share / Workgroup ----
     m_shareInput = new QLineEdit();
+    fixWidth(m_shareInput);
     m_formLayout->addRow(QString(), m_shareInput);
     m_workgroupInput = new QLineEdit();
+    fixWidth(m_workgroupInput);
     m_formLayout->addRow(QString(), m_workgroupInput);
 
     layout->addWidget(m_formGroup);
@@ -245,6 +266,50 @@ void RemoteDialog::retranslate() {
     m_passphraseInput->setPlaceholderText(T("only if the key is encrypted"));
     if (m_shareInput)     m_shareInput->setPlaceholderText(T("share name, e.g. Public"));
     if (m_workgroupInput) m_workgroupInput->setPlaceholderText(T("optional Windows workgroup/domain"));
+
+    // ---- Tooltip：鼠标悬停时显示更详细的提示（中文，多行） ----
+    // 设计：tooltip 比 placeholder 信息更全，包含示例和企业 AD 域场景说明，
+    //      让用户不必查文档就能填对。文本经 T() 走 i18n 查表，如果表里
+    //      没该 key 则 fallback 显示原文（即此处的中文）；要做多语言
+    //      只需在 I18n.cpp 里补对应映射即可。
+    m_protocolCombo->setToolTip(T(
+        "选择连接协议。\n"
+        "• SFTP — 基于 SSH 的安全文件传输（默认端口 22）\n"
+        "• SMB  — Windows / macOS 文件共享协议（默认端口 445）"));
+    m_hostInput->setToolTip(T(
+        "服务器主机名或 IP 地址。\n"
+        "示例：example.com、192.168.1.10、fileserver.corp.local"));
+    m_portSpin->setToolTip(T(
+        "TCP 端口。SFTP 默认 22，SMB 默认 445。\n"
+        "切换协议时若仍为上一协议默认值会自动联动；自定义端口不会被覆盖。"));
+    m_usernameInput->setToolTip(T(
+        "登录用户名。\n"
+        "• SFTP：普通用户名（如 alice）\n"
+        "• SMB / 企业 AD：DOMAIN\\user（如 TENCENT\\chairou）\n"
+        "  或 user@domain（如 chairou@tencent.com）"));
+    m_passwordInput->setToolTip(T(
+        "登录密码。\n"
+        "• SFTP：使用私钥认证时可留空\n"
+        "• SMB：留空表示 guest / 匿名访问"));
+    m_keyPathInput->setToolTip(T(
+        "SSH 私钥文件的路径。\n"
+        "示例：~/.ssh/id_rsa 或 /Users/me/.ssh/id_ed25519\n"
+        "可点击右侧 \"浏览…\" 按钮选择文件。"));
+    m_browseKeyBtn->setToolTip(T("选择私钥文件…"));
+    m_passphraseInput->setToolTip(T(
+        "用于解密私钥的口令。\n"
+        "若私钥未加密则留空。"));
+    if (m_shareInput) m_shareInput->setToolTip(T(
+        "SMB 共享路径，分隔符使用 \"/\"。\n"
+        "示例：\n"
+        "  Public\n"
+        "  tfs/文体协会/腾讯电影协会-影音博物馆\n"
+        "若误填了空格段或反斜杠 \"\\\"，会被自动清理。"));
+    if (m_workgroupInput) m_workgroupInput->setToolTip(T(
+        "Windows 工作组 / AD 域名（建议大写）。\n"
+        "• 家用 / SOHO：留空，默认使用 WORKGROUP\n"
+        "• 企业 AD：填写域名，如 TENCENT\n"
+        "若留空且用户名为 DOMAIN\\user 形式，会自动取其中的 DOMAIN。"));
 
     m_browseKeyBtn->setText(T("Browse…"));
     m_cancelBtn->setText(T("Cancel"));
