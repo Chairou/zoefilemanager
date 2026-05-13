@@ -13,6 +13,22 @@
 #include <QAbstractItemView>
 #include <QScrollBar>
 #include <QRect>
+#include <QFileInfo>
+
+// 把外部传入的 path 规范化成 m_pathToItem 里使用的 key 形式：
+//   - 展开开头的 ~/
+//   - 去掉尾随的 '/'（根 "/" 除外）
+//   - 折叠重复的 '/'
+// 不会做符号链接解析（避免阻塞）；树本身按 RealFileSystem 列出的路径建索引，
+// 一般已经是规范的，问题主要出在外部输入（快捷方式、用户手填等）。
+static QString normalizeTreeKey(const QString& raw) {
+    if (raw.isEmpty()) return raw;
+    QString p = raw;
+    if (p.startsWith("~/")) p = QDir::homePath() + p.mid(1);
+    while (p.contains("//")) p.replace("//", "/");
+    if (p.size() > 1 && p.endsWith('/')) p.chop(1);
+    return p;
+}
 #include <QTimer>
 #include <QFontMetrics>
 #include <QTreeWidgetItemIterator>
@@ -197,7 +213,8 @@ void DirectoryTree::onClickTimeout() {
     emit directorySelected(path);
 }
 
-void DirectoryTree::highlightPath(const QString& path, PanelSide side) {
+void DirectoryTree::highlightPath(const QString& rawPath, PanelSide side) {
+    const QString path = normalizeTreeKey(rawPath);
     // Clear previous highlight for this side
     clearHighlight(side);
 
@@ -230,7 +247,8 @@ void DirectoryTree::clearHighlight(PanelSide side) {
     highlight.clear();
 }
 
-void DirectoryTree::expandToPath(const QString& path) {
+void DirectoryTree::expandToPath(const QString& rawPath) {
+    const QString path = normalizeTreeKey(rawPath);
     // Expand all ancestors, lazy-loading as needed
     QStringList parts = path.split('/', Qt::SkipEmptyParts);
     QString current = "/";
@@ -256,14 +274,15 @@ void DirectoryTree::expandToPath(const QString& path) {
 // 用于面板激活时让左侧树跟随定位。
 // 用 QSignalBlocker 暂时阻断本树信号，防止 setCurrentItem 触发 itemClicked
 // 进而回调 navigateTo 形成重入。
-void DirectoryTree::revealPath(const QString& path) {
-    if (path.isEmpty()) return;
+void DirectoryTree::revealPath(const QString& rawPath) {
+    if (rawPath.isEmpty()) return;
     // 远程/非本地 scheme：本树仅管本地文件系统，直接跳过。
-    if (path.startsWith("sftp://") || path.startsWith("ftp://") ||
-        path.startsWith("ssh://")  || path.startsWith("smb://") ||
-        path.startsWith("http://") || path.startsWith("https://")) {
+    if (rawPath.startsWith("sftp://") || rawPath.startsWith("ftp://") ||
+        rawPath.startsWith("ssh://")  || rawPath.startsWith("smb://") ||
+        rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
         return;
     }
+    const QString path = normalizeTreeKey(rawPath);
     expandToPath(path);
     auto it = m_pathToItem.find(path);
     if (it == m_pathToItem.end()) return;

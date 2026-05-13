@@ -131,9 +131,36 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_dirTree, &DirectoryTree::directorySelected, this, &MainWindow::onDirectoryTreeSelected);
 
     // Connect shortcut bar — clicking a shortcut navigates the active panel
-    connect(m_shortcutBar, &ShortcutBar::shortcutActivated, this,
-            [this](const QString& path) {
-        activePanel()->navigateTo(path);
+    // 然后把左侧目录树同步展开/滚动/高亮到该目录上（仅本地路径有效；
+    // 远程 URL 不在树中，DirectoryTree::revealPath / highlightPath 内部
+    // 会按 scheme 静默跳过）。这样点击快捷方式 ≈ 点击树节点，左右侧的
+    // 视觉联动一致。
+    //
+    // 实现细节：
+    //   - 用 shortcut 自带的 path 作为同步源，不依赖 currentPath() 回环值。
+    //     navigateTo 失败（目录不存在）时，currentPath 不会变，但联动应该
+    //     按用户"想去的位置"展开。
+    //   - DirectoryTree 内部已对 raw path 做 normalize（去尾随 '/' / 展开 ~），
+    //     所以这里直接传原始 path 即可。
+    //   - SFTP / SMB 快捷：先 ensureRemoteMountedFor() 用 item 内凭证发起
+    //     connectAndAuth + mount，成功后再 navigateTo。挂载已存在则跳过。
+    connect(m_shortcutBar, &ShortcutBar::shortcutActivatedFull, this,
+            [this](const ShortcutItem& item) {
+        const bool isRemote = (item.type == "sftp" || item.type == "smb");
+        QString navUrl = item.path;
+        if (isRemote) {
+            if (!ensureRemoteMountedFor(item, &navUrl)) {
+                return;   // 错误已通过 statusBar/QMessageBox 反馈
+            }
+            // navUrl 由 ensureRemoteMountedFor 用 buildUrl/拼装回来的"已编码"
+            // 字面，与 router 内部 mount key 完全一致；用 item.path（未编码）
+            // 会因 startsWith(prefix) 不匹配而路由到 RealFileSystem，列表为空。
+        }
+        activePanel()->navigateTo(navUrl);
+        if (m_dirTree) {
+            m_dirTree->revealPath(item.path);
+            m_dirTree->highlightPath(item.path, m_activePane);
+        }
     });
 
     // Initial highlights
@@ -1583,6 +1610,154 @@ void MainWindow::onExtractArchive(const QString& archivePath, PanelSide side) {
 // 远程连接：弹 RemoteDialog → 用户填表 → SftpClient::connectAndAuth →
 // 成功后 RemoteDialog::takeClient() 转交活会话给我们 → 挂到 router → 跳到 sftp://
 // mountPrefix 同时也是 router 里的 key，断开时用它来 unmount。
+// 由 ShortcutBar 触发的"按需建立 SMB / SFTP 连接并挂到 router"。
+// 设计原则：
+//   - 已挂到同一前缀（host+share / host+port）就直接复用，不重复连接；
+//   - 不复用 RemoteDialog 的 UI，但复用其底层 connectAndAuth 流程；
+//   - 失败弹一次 QMessageBox（与 RemoteDialog 同级提示），不让用户云里雾里；
+//   - 成功后回写 m_remoteMountPrefix / m_isRemoteConnected，断开按钮联动同 onRemoteConnect。
+bool MainWindow::ensureRemoteMountedFor(const ShortcutItem& item, QString* outNavUrl) {
+    if (item.type == "smb") {
+        // 解析 smb://host/<share>[/<sub-path>] —— 关键点：
+        //   1) <sub-path> 必须保留并整体作为 conn.share 传给 SmbClient，否则
+        //      stage-2 DFS referral（如 tencent.com → NS-SZY01.tencent.com）
+        //      不会触发，stage-1 在 DFS namespace 主机上直接 ECONNABORTED(53)。
+        //   2) ShortcutItem.path 里的中文是 *未* percent-encode 的，而 SmbClient
+        //      返回的 entry.path 是 *已* 编码的 —— 必须用 buildUrl() 重新组装
+        //      mount，否则后续浏览时 router 因前缀不匹配走到 RealFileSystem。
+        //   3) navigateTo 时也要用 mount（已编码）而不是 item.path（未编码），
+        //      与 onRemoteConnect 行为对齐。
+        if (!item.path.startsWith("smb://", Qt::CaseInsensitive)) {
+            QMessageBox::warning(this, "SMB", "Invalid SMB URL: " + item.path);
+            return false;
+        }
+        QString rest = item.path.mid(QString("smb://").size());
+        const int slash1 = rest.indexOf('/');
+        QString host      = (slash1 >= 0) ? rest.left(slash1) : rest;
+        QString fullShare = (slash1 >= 0) ? rest.mid(slash1 + 1) : QString();
+        // 去尾随 / 防止空段；前导 / 在 SmbClient::connectAndAuth 内部会再清一次
+        while (fullShare.endsWith('/')) fullShare.chop(1);
+        if (host.isEmpty() || fullShare.isEmpty()) {
+            QMessageBox::warning(this, "SMB",
+                "SMB URL missing host or share: " + item.path);
+            return false;
+        }
+
+        // mount prefix 用编码后的整条路径，与 SmbClient::buildUrl 在浏览时
+        // 拼出来的字面完全一致（同函数同输入 → 同输出）。
+        const QString mount = SmbClient::buildUrl(host, fullShare);
+        if (outNavUrl) *outNavUrl = mount + "/";
+        if (m_remoteMountPrefix == mount && m_isRemoteConnected) {
+            return true;
+        }
+
+        RemoteConnection conn;
+        conn.protocol  = "SMB";
+        conn.host      = host;
+        conn.port      = 445;
+        conn.username  = item.username;
+        conn.password  = item.password;
+        conn.share     = fullShare;     // <- 关键：带 sub-path 一起传，触发 DFS stage-2
+        conn.workgroup = item.workgroup;
+
+        statusBar()->showMessage(
+            QString("Connecting to smb://%1/%2 …").arg(host, fullShare));
+        QApplication::processEvents();
+
+        auto smb = std::make_unique<SmbClient>();
+        if (!smb->connectAndAuth(conn)) {
+            const QString err = smb->lastError();
+            statusBar()->showMessage("✗ SMB: " + err, 5000);
+            QMessageBox::critical(this, "SMB connection failed", err);
+            return false;
+        }
+
+        if (!m_remoteMountPrefix.isEmpty() && m_remoteMountPrefix != mount) {
+            FileSystemRouter::instance().unmount(m_remoteMountPrefix);
+        }
+        FileSystemRouter::instance().mountSmb(mount, std::move(smb));
+        m_remoteMountPrefix = mount;
+        m_isRemoteConnected = true;
+        m_remoteConnectAction->setEnabled(false);
+        m_remoteDisconnectAction->setEnabled(true);
+        statusBar()->showMessage("Connected: " + mount, 3000);
+        return true;
+    }
+
+    if (item.type == "sftp") {
+        // sftp://[user@]host[:port]/path —— mount 以 user@host:port 为粒度。
+        if (!item.path.startsWith("sftp://", Qt::CaseInsensitive)) {
+            QMessageBox::warning(this, "SFTP", "Invalid SFTP URL: " + item.path);
+            return false;
+        }
+        QString rest = item.path.mid(QString("sftp://").size());
+        int slash = rest.indexOf('/');
+        QString userHost = (slash >= 0) ? rest.left(slash) : rest;
+        QString remotePath = (slash >= 0) ? rest.mid(slash) : QString("/");
+
+        QString user;
+        int at = userHost.indexOf('@');
+        if (at >= 0) {
+            user = userHost.left(at);
+            userHost = userHost.mid(at + 1);
+        }
+        QString host = userHost;
+        int port = 22;
+        int colon = userHost.lastIndexOf(':');
+        if (colon >= 0) {
+            host = userHost.left(colon);
+            bool ok = false;
+            int v = userHost.mid(colon + 1).toInt(&ok);
+            if (ok) port = v;
+        }
+        // 优先用 ShortcutItem.username；URL 里没 user 时退回 item.username
+        const QString effectiveUser = !item.username.isEmpty() ? item.username : user;
+        if (host.isEmpty() || effectiveUser.isEmpty()) {
+            QMessageBox::warning(this, "SFTP",
+                "SFTP shortcut needs both host and username.");
+            return false;
+        }
+
+        const QString mount = QString("sftp://%1@%2:%3").arg(effectiveUser, host).arg(port);
+        // sftp 浏览路径 = mount + 远端绝对路径；router 会按 mount 前缀路由到 SftpClient
+        if (outNavUrl) *outNavUrl = mount + (remotePath.startsWith('/') ? remotePath : "/" + remotePath);
+        if (m_remoteMountPrefix == mount && m_isRemoteConnected) {
+            return true;
+        }
+
+        RemoteConnection conn;
+        conn.protocol = "SFTP";
+        conn.host     = host;
+        conn.port     = port;
+        conn.username = effectiveUser;
+        conn.password = item.password;
+
+        statusBar()->showMessage(QString("Connecting to %1 …").arg(mount));
+        QApplication::processEvents();
+
+        auto client = std::make_unique<SftpClient>();
+        if (!client->connectAndAuth(conn, /*openSftpChannel=*/true)) {
+            const QString err = client->lastError();
+            statusBar()->showMessage("✗ SFTP: " + err, 5000);
+            QMessageBox::critical(this, "SFTP connection failed", err);
+            return false;
+        }
+
+        if (!m_remoteMountPrefix.isEmpty() && m_remoteMountPrefix != mount) {
+            FileSystemRouter::instance().unmount(m_remoteMountPrefix);
+        }
+        FileSystemRouter::instance().mount(mount, std::move(client));
+        m_remoteMountPrefix = mount;
+        m_isRemoteConnected = true;
+        m_remoteConnectAction->setEnabled(false);
+        m_remoteDisconnectAction->setEnabled(true);
+        statusBar()->showMessage("Connected: " + mount, 3000);
+        return true;
+    }
+
+    return false;
+}
+
 void MainWindow::onRemoteConnect() {
     RemoteDialog dlg(this);
     bool succeeded = false;

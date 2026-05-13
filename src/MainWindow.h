@@ -126,6 +126,15 @@ private:
     void loadSettings();      // 启动时读取并恢复左右面板路径、活跃面板、几何
     void saveSettings();      // 关闭时写入当前左右面板路径、活跃面板、几何
 
+    // ----- 远程挂载辅助 -----
+    /// 由 ShortcutBar 触发的"按需建立 SMB / SFTP 连接并挂到 router"。
+    /// 已挂载（同前缀）则直接返回；否则用 item 内的凭证发起 connectAndAuth，
+    /// 失败弹错并返回空串。成功时回写 m_remoteMountPrefix / m_isRemoteConnected，
+    /// 并把"应该 navigateTo 的 URL"通过 outNavUrl 回传给调用方（已 percent-encode，
+    /// 与 SmbClient::buildUrl / SftpClient::listDirectory 返回的 entry 字面对齐）。
+    /// 返回值：成功 = true，失败 = false。
+    bool ensureRemoteMountedFor(const ShortcutItem& item, QString* outNavUrl = nullptr);
+
     // ----- 子组件 -----
     QSplitter* m_mainSplitter;
     DirectoryTree* m_dirTree;
