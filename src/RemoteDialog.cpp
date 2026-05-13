@@ -36,9 +36,14 @@ RemoteDialog::RemoteDialog(QWidget* parent)
     // ---- Connection form ----
     m_formGroup  = new QGroupBox();
     m_formLayout = new QFormLayout(m_formGroup);
+    // UI: 用户要求所有输入框左对齐 —— 标签靠左、整表靠左、不换行
+    m_formLayout->setLabelAlignment(Qt::AlignLeft);
+    m_formLayout->setFormAlignment(Qt::AlignLeft | Qt::AlignTop);
+    m_formLayout->setRowWrapPolicy(QFormLayout::DontWrapRows);
 
     m_protocolCombo = new QComboBox();
     m_protocolCombo->addItems({"SFTP", "SMB"});  // 去掉 SSH；SMB 是文件共享
+    m_protocolCombo->setMinimumWidth(200);  // UI: 协议下拉框宽度 ×2
     m_formLayout->addRow(QString(), m_protocolCombo);
 
     m_hostInput = new QLineEdit();
