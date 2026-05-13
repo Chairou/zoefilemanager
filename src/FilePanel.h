@@ -58,6 +58,12 @@ public:
     bool canGoBack() const;
     bool canGoForward() const;
 
+    /// 切换"本面板是否为激活面板"。激活时所有 tab 的文件列表用本侧 accent 色
+    /// 作为选中行底色（左=黄 / 右=绿）；未激活时选中底色透明。
+    /// MainWindow::onPanelActivated 在切换 active panel 时成对调用 ——
+    /// 旧 panel.setActive(false) + 新 panel.setActive(true)。
+    void setActive(bool active);
+
 protected:
     bool eventFilter(QObject* obj, QEvent* event) override;
     // ---- 拖放（drop target）----
@@ -124,6 +130,7 @@ private:
     QPushButton* m_addTabBtn;
     QVector<TabData> m_tabs;
     QColor m_accentColor;       // 左:#4FC3F7，右:Nord Aurora 绿
+    bool m_active = false;      // 当前是否为激活面板（控制选中高亮颜色）
 };
 
 #endif // FILEPANEL_H

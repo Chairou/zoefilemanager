@@ -286,6 +286,12 @@ void MainWindow::loadSettings() {
         m_activePane = PanelSide::Left;
         m_leftPanel->setFocus();
     }
+    if (m_dirTree) m_dirTree->setActiveSide(m_activePane);
+
+    // 初始化激活面板的高亮（与 onPanelActivated 行为一致）：
+    // 左激活=左黄高亮+右透明；右激活=右绿高亮+左透明。
+    m_leftPanel->setActive(m_activePane == PanelSide::Left);
+    m_rightPanel->setActive(m_activePane == PanelSide::Right);
 
     updateStatusBar();
 }
@@ -1898,11 +1904,18 @@ void MainWindow::onPanelSelectionChanged(PanelSide /*side*/) {
 // 哪个面板是 "active"（最近被点击/获焦）—— 决定快捷键和工具栏作用对象
 void MainWindow::onPanelActivated(PanelSide side) {
     m_activePane = side;
+    // 左右面板互斥：只有 active 一侧的文件列表显示彩色高亮，
+    // 另一侧的"选中"行变透明，提示用户焦点在哪。
+    m_leftPanel->setActive(side == PanelSide::Left);
+    m_rightPanel->setActive(side == PanelSide::Right);
     updateStatusBar();
     // 让左侧目录树跟随激活面板：展开+滚动+选中对应目录项。
     // revealPath 对远程/未在树中的路径静默跳过，且内部阻断信号，
     // 不会回调 directorySelected -> navigateTo，避免重入。
     if (m_dirTree) {
+        // 通知目录树当前 active 侧，左右指向同一项时按 active 侧颜色重染，
+        // 让目录树高亮颜色与对应 tab 颜色保持一致。
+        m_dirTree->setActiveSide(side);
         m_dirTree->revealPath(activePanel()->currentPath());
     }
 }

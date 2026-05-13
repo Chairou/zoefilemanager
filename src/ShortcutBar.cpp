@@ -1,13 +1,21 @@
 // =============================================================================
 // ShortcutBar.cpp —— 快捷管理器
 //
-// 数据结构（单层目录）：
-//   m_items[] : 顶层条目，每条可以是 shortcut 或 folder
-//   folder.children[] : 目录子项，必为 shortcut（不再嵌套目录）
+// 数据结构（递归嵌套）：
+//   m_items[] : 顶层条目，每条可以是 shortcut（叶子）或 folder（容器）
+//   folder.children[] : folder 的子项；可同时装叶子（local/sftp/smb）和
+//                       嵌套的子 folder。深度无硬上限。
 //
-// 持久化（QSettings）：
-//   shortcuts[i] = { name, path, isFolder, expanded, children[] }
-//     若 isFolder 缺失，按旧版 flat 结构兼容读取（视为 shortcut）。
+// 持久化（QSettings，递归数组）：
+//   shortcuts[i] = { name, path, type, isFolder, expanded,
+//                    username, password_obf, workgroup,    // 叶子专属
+//                    children[]                            // folder 专属，递归同结构
+//   }
+//   兼容性：
+//     - isFolder 缺省视为 false；
+//     - type 缺省按 path 前缀推断（sftp:// → sftp，smb:// → smb，否则 local）；
+//     - 旧版本仅支持 children 单层无嵌套的数据，被新代码当作"folder 但不再
+//       含子 folder"读入，向后兼容。
 // =============================================================================
 
 #include "ShortcutBar.h"
@@ -27,6 +35,9 @@
 #include <QFileInfo>
 #include <QInputDialog>
 #include <QMenu>
+#include <QCursor>
+#include <QStyle>
+#include <QApplication>
 #include <QMessageBox>
 #include <QByteArray>
 #include <QSettings>
@@ -40,15 +51,24 @@ namespace {
 //   local : 📁 蓝绿（Nord8 #88C0D0）—— 与 macOS Finder 习惯一致
 //   sftp  : 🌐 绿色（Nord14 #A3BE8C）—— 强调"网络/远程主机"
 //   smb   : 🖥️ 紫色（Nord15 #B48EAD）—— 强调"Windows/共享磁盘"
+// 类型 → 视觉样式的小映射表。
+// 设计意图（重要）：
+//   local : 📂 emoji + 青色（Nord8 #88C0D0）—— 用开口文件夹 emoji，
+//           与"快捷目录"📁（合口）形成视觉对比，让用户一眼区分
+//           "本地真实目录（叶子）" vs "用来组织条目的快捷目录（容器）"
+//   sftp  : 🌐 emoji + 绿色（Nord14 #A3BE8C）—— 强调"网络/远程主机"
+//   smb   : 🖥 emoji + 紫色（Nord15 #B48EAD）—— 强调"Windows/共享磁盘"
+// 三种类型统一走「prefix + emoji + name」文本渲染路径，
+// 保证 indent 缩进的文本起点完全一致（避免 setIcon 把文本整体右推）。
 struct TypeStyle {
-    QString iconUtf8;
-    QString accent;        // 用于 hover 时的强调色 + 副本字体色
+    QString iconUtf8;       // 全部走 emoji 文本（不再使用 setIcon）
+    QString accent;         // hover 时的强调色 + 选中态左侧 3px 边色
 };
 
 TypeStyle styleFor(const QString& type) {
-    if (type == "sftp") return { QString::fromUtf8("\xF0\x9F\x8C\x90"), "#A3BE8C" };  // 🌐 Nord14
-    if (type == "smb")  return { QString::fromUtf8("\xF0\x9F\x96\xA5"), "#B48EAD" };  // 🖥 Nord15
-    /* local */          return { QString::fromUtf8("\xF0\x9F\x93\x81"), "#88C0D0" }; // 📁 Nord8
+    if (type == "sftp") return { QString::fromUtf8("\xF0\x9F\x8C\x90"), "#A3BE8C" };  // 🌐
+    if (type == "smb")  return { QString::fromUtf8("\xF0\x9F\x96\xA5"), "#B48EAD" };  // 🖥
+    /* local */          return { QString::fromUtf8("\xF0\x9F\x93\x82"), "#88C0D0" };  // 📂
 }
 
 // 统一的添加 / 编辑对话框：(type, name, path-or-url)
@@ -582,6 +602,41 @@ bool validatePath(const QString& type, const QString& path, QString* errOut) {
     return false;
 }
 
+// 给 QMenu 应用统一的 Nord 暗色不透明样式。
+// 不设此样式时，macOS 暗色主题下默认 vibrancy 会让菜单半透明、文字与桌面
+// 互相干扰看不清；这里显式覆盖背景色 + 边框 + hover/separator，使其完全
+// 不透明，并与 ShortcutBar 视觉风格一致。
+static void applyMenuStyle(QMenu* m) {
+    if (!m) return;
+    // 关键：关闭 Mac 原生 vibrancy，强制 Qt 自绘背景，否则 stylesheet 的
+    // background 会被半透明窗体合成穿透。
+    m->setAttribute(Qt::WA_TranslucentBackground, false);
+    m->setStyleSheet(
+        "QMenu {"
+        "  background: #2E3440;"          // Nord Polar Night
+        "  color: #E5E9F0;"
+        "  border: 1px solid #4C566A;"
+        "  padding: 4px 0px;"
+        "}"
+        "QMenu::item {"
+        "  background: transparent;"
+        "  padding: 6px 18px;"
+        "}"
+        "QMenu::item:selected {"
+        "  background: #5E81AC;"
+        "  color: #ECEFF4;"
+        "}"
+        "QMenu::item:disabled {"
+        "  color: #6C7280;"
+        "}"
+        "QMenu::separator {"
+        "  height: 1px;"
+        "  background: #434C5E;"
+        "  margin: 4px 8px;"
+        "}"
+    );
+}
+
 } // namespace
 
 // =============================================================================
@@ -674,98 +729,215 @@ void ShortcutBar::retranslate() {
 // =============================================================================
 
 QPushButton* ShortcutBar::makeShortcutButton(const ShortcutItem& item, int indent,
-                                             int folderIndex, int idxInParent) {
+                                             const QVector<int>& path) {
     QString prefix;
     for (int i = 0; i < indent; ++i) prefix += QStringLiteral("    ");
 
     const TypeStyle ts = styleFor(item.type);
-    auto* btn = new QPushButton(prefix + ts.iconUtf8 + " " + item.name);
-    // tooltip 同时显示 path/URL，便于区分多条同名快捷方式
+    // 三种类型统一：prefix + emoji + name，保证 indent 文本起点对齐
+    QString label = prefix + ts.iconUtf8 + " " + item.name;
+    auto* btn = new QPushButton(label);
     btn->setToolTip(item.path);
     btn->setCursor(Qt::PointingHandCursor);
     btn->setContextMenuPolicy(Qt::CustomContextMenu);
     btn->setFocusPolicy(Qt::NoFocus);
 
-    // 按 type 调整 hover 强调色（border + text），让用户一眼识别远程/本地
-    btn->setStyleSheet(QString(
-        "QPushButton {"
-        "  text-align: left;"
-        "  padding: 5px 10px;"
-        "  background: #3B4252;"
-        "  color: #E5E9F0;"
-        "  border: 1px solid #434C5E;"
-        "  border-radius: 4px;"
-        "}"
-        "QPushButton:hover {"
-        "  background: #434C5E;"
-        "  color: %1;"
-        "  border-color: %1;"
-        "}"
-        "QPushButton:pressed {"
-        "  background: #5E81AC;"
-        "  color: #ECEFF4;"
-        "  border-color: #5E81AC;"
-        "}").arg(ts.accent));
+    // 选中态判断：m_selectedPath（QVector<int>）与当前 path 完全相等
+    const bool selected = (m_selectedPath == path);
 
-    QString path = item.path;
-    ShortcutItem snapshot = item;   // 拷贝一份，按值捕获，不依赖外部 m_items 生命周期
-    connect(btn, &QPushButton::clicked, this, [this, path, snapshot]() {
-        emit shortcutActivated(path);
+    if (selected) {
+        btn->setStyleSheet(QString(
+            "QPushButton {"
+            "  text-align: left;"
+            "  padding: 5px 10px;"
+            "  background: #5E81AC;"
+            "  color: #ECEFF4;"
+            "  border: 1px solid #5E81AC;"
+            "  border-left: 3px solid %1;"
+            "  border-radius: 4px;"
+            "}"
+            "QPushButton:hover {"
+            "  background: #6A8FBF;"
+            "  border-color: #6A8FBF;"
+            "  border-left: 3px solid %1;"
+            "}"
+            "QPushButton:pressed {"
+            "  background: #4C6E96;"
+            "  border-color: #4C6E96;"
+            "  border-left: 3px solid %1;"
+            "}").arg(ts.accent));
+    } else {
+        btn->setStyleSheet(QString(
+            "QPushButton {"
+            "  text-align: left;"
+            "  padding: 5px 10px;"
+            "  background: #3B4252;"
+            "  color: #E5E9F0;"
+            "  border: 1px solid #434C5E;"
+            "  border-radius: 4px;"
+            "}"
+            "QPushButton:hover {"
+            "  background: #434C5E;"
+            "  color: %1;"
+            "  border-color: %1;"
+            "}"
+            "QPushButton:pressed {"
+            "  background: #5E81AC;"
+            "  color: #ECEFF4;"
+            "  border-color: #5E81AC;"
+            "}").arg(ts.accent));
+    }
+
+    QString sPath = item.path;
+    ShortcutItem snapshot = item;
+    QVector<int> nodePath = path;
+    connect(btn, &QPushButton::clicked, this, [this, sPath, snapshot, nodePath]() {
+        m_selectedPath = nodePath;
+        rebuildButtons();
+        emit shortcutActivated(sPath);
         emit shortcutActivatedFull(snapshot);
     });
 
     connect(btn, &QPushButton::customContextMenuRequested, this,
-            [this, btn, folderIndex, idxInParent](const QPoint& pos) {
-        QMenu menu(btn);
-        menu.addAction(T("Edit..."), this, [this, folderIndex, idxInParent]() {
-            if (folderIndex < 0) editTopLevel(idxInParent);
-            else                 editChildOfFolder(folderIndex, idxInParent);
-        });
-        menu.addSeparator();
-        menu.addAction(T("Remove"), this, [this, folderIndex, idxInParent]() {
-            if (folderIndex < 0) removeTopLevel(idxInParent);
-            else                 removeChildFromFolder(folderIndex, idxInParent);
-        });
-        menu.exec(btn->mapToGlobal(pos));
+            [this, btn, nodePath](const QPoint& pos) {
+        const bool needRebuild = (m_selectedPath != nodePath);
+        auto buildMenu = [this, nodePath](QWidget* parent) {
+            auto* m = new QMenu(parent);
+            applyMenuStyle(m);
+            m->addAction(T("Edit..."), this, [this, nodePath]() {
+                editAtPath(nodePath);
+            });
+            // shortcut 自身不能装东西，但允许就近添加：在它所在 folder（path 去掉末位）下添加
+            QVector<int> parentFolder = nodePath;
+            if (!parentFolder.isEmpty()) parentFolder.removeLast();
+            m->addAction(T("Add shortcut here..."), this, [this, parentFolder]() {
+                addShortcutUnder(parentFolder);
+            });
+            m->addAction(T("Add shortcut folder..."), this, [this, parentFolder]() {
+                addFolderUnder(parentFolder);
+            });
+            m->addSeparator();
+            m->addAction(T("Remove"), this, [this, nodePath]() {
+                removeAtPath(nodePath);
+            });
+            return m;
+        };
+        if (needRebuild) {
+            m_selectedPath = nodePath;
+            rebuildButtons();
+            QMenu* menu = buildMenu(this);
+            menu->exec(QCursor::pos());
+            menu->deleteLater();
+            return;
+        }
+        QMenu* menu = buildMenu(btn);
+        menu->exec(btn->mapToGlobal(pos));
+        menu->deleteLater();
     });
 
     return btn;
 }
 
-QPushButton* ShortcutBar::makeFolderButton(const ShortcutItem& item, int folderIndex) {
-    // 头部用 ▼/▶ 表示展开折叠，emoji 表示这是目录
+QPushButton* ShortcutBar::makeFolderButton(const ShortcutItem& item, int indent,
+                                           const QVector<int>& path) {
+    QString prefix;
+    for (int i = 0; i < indent; ++i) prefix += QStringLiteral("    ");
+
     const QString arrow = item.expanded
         ? QString::fromUtf8("\xE2\x96\xBC")    // ▼
         : QString::fromUtf8("\xE2\x96\xB6");   // ▶
     const QString folderIcon = QString::fromUtf8("\xF0\x9F\x93\x81"); // 📁
-    auto* btn = new QPushButton(arrow + " " + folderIcon + " " + item.name +
+    auto* btn = new QPushButton(prefix + arrow + " " + folderIcon + " " + item.name +
                                 QString("  (%1)").arg(item.children.size()));
     btn->setCursor(Qt::PointingHandCursor);
     btn->setContextMenuPolicy(Qt::CustomContextMenu);
     btn->setFocusPolicy(Qt::NoFocus);
-    btn->setStyleSheet(makeFolderBtnStyle());
 
-    connect(btn, &QPushButton::clicked, this, [this, folderIndex]() {
-        toggleFolderExpanded(folderIndex);
+    // folder 自身高亮 OR 作为"选中的 shortcut 所在 folder"高亮（就近反馈"新增会落到这里"）
+    const QVector<int> targetFolder = selectedTargetFolderPath();
+    const bool selected = (m_selectedPath == path) || (targetFolder == path);
+
+    if (selected) {
+        btn->setStyleSheet(
+            "QPushButton {"
+            "  text-align: left;"
+            "  padding: 6px 10px;"
+            "  background: #5E81AC;"
+            "  color: #ECEFF4;"
+            "  border: 1px solid #5E81AC;"
+            "  border-left: 3px solid #EBCB8B;"
+            "  border-radius: 4px;"
+            "  font-weight: bold;"
+            "}"
+            "QPushButton:hover {"
+            "  background: #6A8FBF;"
+            "  border-color: #6A8FBF;"
+            "  border-left: 3px solid #EBCB8B;"
+            "}"
+        );
+    } else {
+        btn->setStyleSheet(makeFolderBtnStyle());
+    }
+
+    QVector<int> nodePath = path;
+    connect(btn, &QPushButton::clicked, this, [this, nodePath]() {
+        // 单击：选中 folder + toggle expanded
+        m_selectedPath = nodePath;
+        toggleExpandedAtPath(nodePath);   // 内部 saveToSettings + rebuildButtons
     });
 
     connect(btn, &QPushButton::customContextMenuRequested, this,
-            [this, btn, folderIndex](const QPoint& pos) {
-        QMenu menu(btn);
-        menu.addAction(T("Add shortcut here..."), this, [this, folderIndex]() {
-            addChildToFolder(folderIndex);
-        });
-        menu.addAction(T("Rename folder..."), this, [this, folderIndex]() {
-            editTopLevel(folderIndex);
-        });
-        menu.addSeparator();
-        menu.addAction(T("Remove folder"), this, [this, folderIndex]() {
-            removeTopLevel(folderIndex);
-        });
-        menu.exec(btn->mapToGlobal(pos));
+            [this, btn, nodePath](const QPoint& pos) {
+        const bool needRebuild = (m_selectedPath != nodePath);
+        auto buildMenu = [this, nodePath](QWidget* parent) {
+            auto* m = new QMenu(parent);
+            applyMenuStyle(m);
+            m->addAction(T("Add shortcut here..."), this, [this, nodePath]() {
+                addShortcutUnder(nodePath);
+            });
+            m->addAction(T("Add shortcut folder..."), this, [this, nodePath]() {
+                addFolderUnder(nodePath);   // 在该 folder 下添加子快捷目录（嵌套）
+            });
+            m->addAction(T("Rename folder..."), this, [this, nodePath]() {
+                editAtPath(nodePath);
+            });
+            m->addSeparator();
+            m->addAction(T("Remove folder"), this, [this, nodePath]() {
+                removeAtPath(nodePath);
+            });
+            return m;
+        };
+        if (needRebuild) {
+            m_selectedPath = nodePath;
+            rebuildButtons();
+            QMenu* menu = buildMenu(this);
+            menu->exec(QCursor::pos());
+            menu->deleteLater();
+            return;
+        }
+        QMenu* menu = buildMenu(btn);
+        menu->exec(btn->mapToGlobal(pos));
+        menu->deleteLater();
     });
 
     return btn;
+}
+
+void ShortcutBar::renderItems(const QVector<ShortcutItem>& items,
+                              const QVector<int>& parentPath, int indent) {
+    for (int i = 0; i < items.size(); ++i) {
+        QVector<int> path = parentPath;
+        path.append(i);
+        const auto& it = items[i];
+        if (it.isFolder) {
+            m_listLayout->addWidget(makeFolderButton(it, indent, path));
+            if (it.expanded) {
+                renderItems(it.children, path, indent + 1);
+            }
+        } else {
+            m_listLayout->addWidget(makeShortcutButton(it, indent, path));
+        }
+    }
 }
 
 void ShortcutBar::rebuildButtons() {
@@ -774,23 +946,42 @@ void ShortcutBar::rebuildButtons() {
         if (QWidget* w = item->widget()) w->deleteLater();
         delete item;
     }
-
-    for (int i = 0; i < m_items.size(); ++i) {
-        const auto& it = m_items[i];
-        if (it.isFolder) {
-            m_listLayout->addWidget(makeFolderButton(it, i));
-            if (it.expanded) {
-                for (int j = 0; j < it.children.size(); ++j) {
-                    m_listLayout->addWidget(
-                        makeShortcutButton(it.children[j], /*indent*/1, /*folder*/i, j));
-                }
-            }
-        } else {
-            m_listLayout->addWidget(
-                makeShortcutButton(it, /*indent*/0, /*folder*/-1, i));
-        }
-    }
+    renderItems(m_items, /*parentPath*/{}, /*indent*/0);
     m_listLayout->addStretch();
+}
+
+// =============================================================================
+// 路径辅助
+// =============================================================================
+
+ShortcutItem* ShortcutBar::itemAt(const QVector<int>& path) {
+    if (path.isEmpty()) return nullptr;
+    QVector<ShortcutItem>* level = &m_items;
+    ShortcutItem* node = nullptr;
+    for (int depth = 0; depth < path.size(); ++depth) {
+        const int idx = path[depth];
+        if (idx < 0 || idx >= level->size()) return nullptr;
+        node = &(*level)[idx];
+        if (depth == path.size() - 1) return node;
+        if (!node->isFolder) return nullptr;   // 中间路径必须是 folder
+        level = &node->children;
+    }
+    return node;
+}
+
+const ShortcutItem* ShortcutBar::itemAt(const QVector<int>& path) const {
+    return const_cast<ShortcutBar*>(this)->itemAt(path);
+}
+
+QVector<int> ShortcutBar::selectedTargetFolderPath() const {
+    if (m_selectedPath.isEmpty()) return {};
+    const ShortcutItem* sel = itemAt(m_selectedPath);
+    if (!sel) return {};
+    if (sel->isFolder) return m_selectedPath;
+    // 选中的是 shortcut → 返回它所在 folder 路径（去掉末位 index）
+    QVector<int> p = m_selectedPath;
+    p.removeLast();
+    return p;
 }
 
 // =============================================================================
@@ -803,79 +994,119 @@ void ShortcutBar::addTopLevel(const ShortcutItem& item) {
     rebuildButtons();
 }
 
-void ShortcutBar::removeTopLevel(int index) {
-    if (index < 0 || index >= m_items.size()) return;
-    const bool zh = (I18n::instance().current() == I18n::Lang::Zh);
-    const auto& it = m_items[index];
+// =============================================================================
+// 通用增删改（按 path 定位）
+// =============================================================================
 
+void ShortcutBar::removeAtPath(const QVector<int>& path) {
+    if (path.isEmpty()) return;
+    // 先确认存在
+    const ShortcutItem* node = itemAt(path);
+    if (!node) return;
+
+    const bool zh = (I18n::instance().current() == I18n::Lang::Zh);
     QString msg;
-    if (it.isFolder) {
+    if (node->isFolder) {
+        // 递归统计后代叶子数（仅作提示用，不严格）
+        std::function<int(const ShortcutItem&)> countLeaves = [&](const ShortcutItem& it) -> int {
+            if (!it.isFolder) return 1;
+            int n = 0;
+            for (const auto& c : it.children) n += countLeaves(c);
+            return n;
+        };
+        const int leaves = countLeaves(*node);
         msg = (zh
-            ? QString("是否移除目录 \"%1\"？该目录内的 %2 个快捷方式将一并删除。")
-            : QString("Remove folder \"%1\"? Its %2 shortcut(s) will be removed too."))
-              .arg(it.name).arg(it.children.size());
+            ? QString("是否移除快捷目录 \"%1\"？该目录及其下 %2 个条目将一并删除。")
+            : QString("Remove shortcut folder \"%1\"? It and %2 entries inside will be removed."))
+              .arg(node->name).arg(leaves);
     } else {
         msg = (zh ? QString("是否移除快捷方式 \"%1\"？")
-                  : QString("Remove shortcut \"%1\"?")).arg(it.name);
+                  : QString("Remove shortcut \"%1\"?")).arg(node->name);
     }
     auto ans = QMessageBox::question(this,
-        it.isFolder ? T("Remove folder") : T("Remove shortcut"), msg);
+        node->isFolder ? T("Remove folder") : T("Remove shortcut"), msg);
     if (ans != QMessageBox::Yes) return;
 
-    m_items.removeAt(index);
+    // 找到父级 vector 然后 removeAt
+    QVector<int> parentPath = path;
+    parentPath.removeLast();
+    QVector<ShortcutItem>* parentVec = nullptr;
+    if (parentPath.isEmpty()) {
+        parentVec = &m_items;
+    } else {
+        ShortcutItem* parentNode = itemAt(parentPath);
+        if (!parentNode || !parentNode->isFolder) return;
+        parentVec = &parentNode->children;
+    }
+    const int idx = path.last();
+    if (idx < 0 || idx >= parentVec->size()) return;
+    parentVec->removeAt(idx);
+
+    // 清理选中态：若选中条目是被删的或其后代，则清空；否则若被删条目在前面 → 同级索引前移
+    if (!m_selectedPath.isEmpty()) {
+        // 判断 m_selectedPath 是否以 path 为前缀（含相等）
+        bool isAncestorOrSelf = (m_selectedPath.size() >= path.size());
+        for (int i = 0; isAncestorOrSelf && i < path.size(); ++i) {
+            if (m_selectedPath[i] != path[i]) isAncestorOrSelf = false;
+        }
+        if (isAncestorOrSelf) {
+            m_selectedPath.clear();
+        } else if (m_selectedPath.size() >= path.size()
+                   && std::equal(parentPath.begin(), parentPath.end(), m_selectedPath.begin())
+                   && m_selectedPath[parentPath.size()] > idx) {
+            // 同父级，被删项在前 → 索引前移
+            --m_selectedPath[parentPath.size()];
+        }
+    }
+
     saveToSettings();
     rebuildButtons();
 }
 
-void ShortcutBar::editTopLevel(int index) {
-    if (index < 0 || index >= m_items.size()) return;
-    auto& it = m_items[index];
+void ShortcutBar::editAtPath(const QVector<int>& path) {
+    ShortcutItem* node = itemAt(path);
+    if (!node) return;
 
-    if (it.isFolder) {
+    if (node->isFolder) {
         bool ok = false;
         QString name = QInputDialog::getText(this, T("Rename folder"),
                                              T("Folder name:"), QLineEdit::Normal,
-                                             it.name, &ok).trimmed();
+                                             node->name, &ok).trimmed();
         if (!ok || name.isEmpty()) return;
-        it.name = name;
+        node->name = name;
         saveToSettings();
         rebuildButtons();
     } else {
-        AddShortcutDialog dlg(this, it.type, it.name, it.path);
-        dlg.setCredentials(it.username, it.password, it.workgroup);
+        AddShortcutDialog dlg(this, node->type, node->name, node->path);
+        dlg.setCredentials(node->username, node->password, node->workgroup);
         if (dlg.exec() != QDialog::Accepted) return;
         QString err;
         if (!validatePath(dlg.type(), dlg.path(), &err)) {
             QMessageBox::warning(this, T("Invalid path"), err);
             return;
         }
-        it.type      = dlg.type();
-        it.name      = dlg.name();
-        it.path      = dlg.path();
-        it.username  = dlg.username();
-        it.password  = dlg.password();
-        it.workgroup = dlg.workgroup();
+        node->type      = dlg.type();
+        node->name      = dlg.name();
+        node->path      = dlg.path();
+        node->username  = dlg.username();
+        node->password  = dlg.password();
+        node->workgroup = dlg.workgroup();
         saveToSettings();
         rebuildButtons();
     }
 }
 
-void ShortcutBar::toggleFolderExpanded(int index) {
-    if (index < 0 || index >= m_items.size()) return;
-    if (!m_items[index].isFolder) return;
-    m_items[index].expanded = !m_items[index].expanded;
-    saveToSettings();
-    rebuildButtons();
-}
-
-// =============================================================================
-// 目录子项操作
-// =============================================================================
-
-void ShortcutBar::addChildToFolder(int folderIndex) {
-    if (folderIndex < 0 || folderIndex >= m_items.size()) return;
-    if (!m_items[folderIndex].isFolder) return;
-
+void ShortcutBar::addShortcutUnder(const QVector<int>& folderPath) {
+    // folderPath 为空 → 顶层；否则必须指向一个快捷目录
+    QVector<ShortcutItem>* level = nullptr;
+    ShortcutItem* folderNode = nullptr;
+    if (folderPath.isEmpty()) {
+        level = &m_items;
+    } else {
+        folderNode = itemAt(folderPath);
+        if (!folderNode || !folderNode->isFolder) return;
+        level = &folderNode->children;
+    }
     AddShortcutDialog dlg(this);
     if (dlg.exec() != QDialog::Accepted) return;
     QString err;
@@ -891,50 +1122,43 @@ void ShortcutBar::addChildToFolder(int folderIndex) {
     child.password  = dlg.password();
     child.workgroup = dlg.workgroup();
     child.isFolder  = false;
-    m_items[folderIndex].children.append(child);
-    m_items[folderIndex].expanded = true;
+    level->append(child);
+    if (folderNode) folderNode->expanded = true;
     saveToSettings();
     rebuildButtons();
 }
 
-void ShortcutBar::removeChildFromFolder(int folderIndex, int childIndex) {
-    if (folderIndex < 0 || folderIndex >= m_items.size()) return;
-    auto& folder = m_items[folderIndex];
-    if (!folder.isFolder) return;
-    if (childIndex < 0 || childIndex >= folder.children.size()) return;
-
-    const bool zh = (I18n::instance().current() == I18n::Lang::Zh);
-    auto ans = QMessageBox::question(this, T("Remove shortcut"),
-        QString(zh ? "是否移除快捷方式 \"%1\"？" : "Remove shortcut \"%1\"?")
-            .arg(folder.children[childIndex].name));
-    if (ans != QMessageBox::Yes) return;
-
-    folder.children.removeAt(childIndex);
-    saveToSettings();
-    rebuildButtons();
-}
-
-void ShortcutBar::editChildOfFolder(int folderIndex, int childIndex) {
-    if (folderIndex < 0 || folderIndex >= m_items.size()) return;
-    auto& folder = m_items[folderIndex];
-    if (!folder.isFolder) return;
-    if (childIndex < 0 || childIndex >= folder.children.size()) return;
-
-    auto& c = folder.children[childIndex];
-    AddShortcutDialog dlg(this, c.type, c.name, c.path);
-    dlg.setCredentials(c.username, c.password, c.workgroup);
-    if (dlg.exec() != QDialog::Accepted) return;
-    QString err;
-    if (!validatePath(dlg.type(), dlg.path(), &err)) {
-        QMessageBox::warning(this, T("Invalid path"), err);
-        return;
+void ShortcutBar::addFolderUnder(const QVector<int>& folderPath) {
+    QVector<ShortcutItem>* level = nullptr;
+    ShortcutItem* folderNode = nullptr;
+    if (folderPath.isEmpty()) {
+        level = &m_items;
+    } else {
+        folderNode = itemAt(folderPath);
+        if (!folderNode || !folderNode->isFolder) return;
+        level = &folderNode->children;
     }
-    c.type      = dlg.type();
-    c.name      = dlg.name();
-    c.path      = dlg.path();
-    c.username  = dlg.username();
-    c.password  = dlg.password();
-    c.workgroup = dlg.workgroup();
+    bool ok = false;
+    const bool zh = (I18n::instance().current() == I18n::Lang::Zh);
+    QString name = QInputDialog::getText(this, T("Add folder"),
+                                         T("Folder name:"), QLineEdit::Normal,
+                                         zh ? "新快捷目录" : "New shortcut folder",
+                                         &ok).trimmed();
+    if (!ok || name.isEmpty()) return;
+    ShortcutItem item;
+    item.name = name;
+    item.isFolder = true;
+    item.expanded = true;
+    level->append(item);
+    if (folderNode) folderNode->expanded = true;
+    saveToSettings();
+    rebuildButtons();
+}
+
+void ShortcutBar::toggleExpandedAtPath(const QVector<int>& folderPath) {
+    ShortcutItem* node = itemAt(folderPath);
+    if (!node || !node->isFolder) return;
+    node->expanded = !node->expanded;
     saveToSettings();
     rebuildButtons();
 }
@@ -944,38 +1168,15 @@ void ShortcutBar::editChildOfFolder(int folderIndex, int childIndex) {
 // =============================================================================
 
 void ShortcutBar::onAddShortcutClicked() {
-    AddShortcutDialog dlg(this);
-    if (dlg.exec() != QDialog::Accepted) return;
-
-    QString err;
-    if (!validatePath(dlg.type(), dlg.path(), &err)) {
-        QMessageBox::warning(this, T("Invalid path"), err);
-        return;
-    }
-    ShortcutItem item;
-    item.type      = dlg.type();
-    item.name      = dlg.name();
-    item.path      = dlg.path();
-    item.username  = dlg.username();
-    item.password  = dlg.password();
-    item.workgroup = dlg.workgroup();
-    item.isFolder  = false;
-    addTopLevel(item);
+    // 智能落点：选中态指向某个 folder（含选中其子 shortcut 时回退到所在 folder）
+    QVector<int> target = selectedTargetFolderPath();
+    addShortcutUnder(target);
 }
 
 void ShortcutBar::onAddFolderClicked() {
-    bool ok = false;
-    const bool zh = (I18n::instance().current() == I18n::Lang::Zh);
-    QString name = QInputDialog::getText(this, T("Add folder"),
-                                         T("Folder name:"), QLineEdit::Normal,
-                                         zh ? "新目录" : "New folder",
-                                         &ok).trimmed();
-    if (!ok || name.isEmpty()) return;
-    ShortcutItem item;
-    item.name = name;
-    item.isFolder = true;
-    item.expanded = true;
-    addTopLevel(item);
+    // 智能落点：与新增 shortcut 一致——可在选中 folder 下嵌套创建子快捷目录
+    QVector<int> target = selectedTargetFolderPath();
+    addFolderUnder(target);
 }
 
 // =============================================================================
@@ -1010,6 +1211,70 @@ QString deobfuscate(const QString& obf) {
 }
 } // namespace
 
+// 旧版本数据无 "type" 字段时，按 path 前缀推断
+static QString inferTypeFromPath(const QString& path) {
+    if (path.startsWith("sftp://", Qt::CaseInsensitive)) return "sftp";
+    if (path.startsWith("smb://",  Qt::CaseInsensitive)) return "smb";
+    return "local";
+}
+
+// 递归读取一个 QSettings 数组（已 beginReadArray）→ QVector<ShortcutItem>
+// 调用约定：函数内部用 setArrayIndex 切到第 i 项；不负责 beginReadArray /
+// endArray 本身——那个由调用者负责（顶层用 "shortcuts"，子层用 "children"）。
+static QVector<ShortcutItem> readArrayRecursive(QSettings& s, int size) {
+    QVector<ShortcutItem> items;
+    items.reserve(size);
+    for (int i = 0; i < size; ++i) {
+        s.setArrayIndex(i);
+        ShortcutItem item;
+        item.name     = s.value("name").toString();
+        item.path     = s.value("path").toString();
+        item.isFolder = s.value("isFolder", false).toBool();
+        item.expanded = s.value("expanded", true).toBool();
+        item.type     = s.value("type", inferTypeFromPath(item.path)).toString();
+        item.username = s.value("username").toString();
+        item.password = deobfuscate(s.value("password_obf").toString());
+        item.workgroup= s.value("workgroup").toString();
+
+        if (item.isFolder) {
+            const int childCount = s.beginReadArray("children");
+            item.children = readArrayRecursive(s, childCount);
+            s.endArray();
+            if (!item.name.isEmpty()) items.append(item);
+        } else {
+            if (!item.name.isEmpty() && !item.path.isEmpty()) {
+                items.append(item);
+            }
+        }
+    }
+    return items;
+}
+
+// 递归写一个 QVector<ShortcutItem> 到当前 QSettings 数组（已 beginWriteArray）。
+// 与 readArrayRecursive 对称：begin/end 由调用者负责。
+static void writeArrayRecursive(QSettings& s, const QVector<ShortcutItem>& items) {
+    for (int i = 0; i < items.size(); ++i) {
+        s.setArrayIndex(i);
+        const auto& it = items[i];
+        s.setValue("name", it.name);
+        s.setValue("path", it.path);
+        s.setValue("type", it.type);
+        s.setValue("isFolder", it.isFolder);
+        s.setValue("expanded", it.expanded);
+        if (!it.isFolder) {
+            // 凭证仅在快捷方式（叶子）上才有意义；密码混淆后写盘。
+            s.setValue("username",     it.username);
+            s.setValue("password_obf", obfuscate(it.password));
+            s.setValue("workgroup",    it.workgroup);
+        } else {
+            // folder 写 children 子数组（即使为空也写，便于 reload 时清晰）
+            s.beginWriteArray("children", it.children.size());
+            writeArrayRecursive(s, it.children);
+            s.endArray();
+        }
+    }
+}
+
 void ShortcutBar::loadFromSettings() {
     QSettings s(kSettingsOrg, kSettingsApp);
     int size = s.beginReadArray("shortcuts");
@@ -1034,13 +1299,7 @@ void ShortcutBar::loadFromSettings() {
             }
             legacy.endArray();
             s.beginWriteArray("shortcuts", migrated.size());
-            for (int i = 0; i < migrated.size(); ++i) {
-                s.setArrayIndex(i);
-                s.setValue("name", migrated[i].name);
-                s.setValue("path", migrated[i].path);
-                s.setValue("type", migrated[i].type);
-                s.setValue("isFolder", false);
-            }
+            writeArrayRecursive(s, migrated);
             s.endArray();
         } else {
             legacy.endArray();
@@ -1048,50 +1307,7 @@ void ShortcutBar::loadFromSettings() {
         size = s.beginReadArray("shortcuts");
     }
 
-    // 旧版本数据无 "type" 字段时，按 path 前缀推断
-    auto inferType = [](const QString& path) -> QString {
-        if (path.startsWith("sftp://", Qt::CaseInsensitive)) return "sftp";
-        if (path.startsWith("smb://",  Qt::CaseInsensitive)) return "smb";
-        return "local";
-    };
-
-    m_items.clear();
-    for (int i = 0; i < size; ++i) {
-        s.setArrayIndex(i);
-        ShortcutItem item;
-        item.name     = s.value("name").toString();
-        item.path     = s.value("path").toString();
-        item.isFolder = s.value("isFolder", false).toBool();
-        item.expanded = s.value("expanded", true).toBool();
-        item.type     = s.value("type", inferType(item.path)).toString();
-        item.username = s.value("username").toString();
-        item.password = deobfuscate(s.value("password_obf").toString());
-        item.workgroup= s.value("workgroup").toString();
-
-        if (item.isFolder) {
-            int childCount = s.beginReadArray("children");
-            for (int j = 0; j < childCount; ++j) {
-                s.setArrayIndex(j);
-                ShortcutItem child;
-                child.name = s.value("name").toString();
-                child.path = s.value("path").toString();
-                child.isFolder = false;
-                child.type = s.value("type", inferType(child.path)).toString();
-                child.username = s.value("username").toString();
-                child.password = deobfuscate(s.value("password_obf").toString());
-                child.workgroup= s.value("workgroup").toString();
-                if (!child.name.isEmpty() && !child.path.isEmpty()) {
-                    item.children.append(child);
-                }
-            }
-            s.endArray();
-            if (!item.name.isEmpty()) m_items.append(item);
-        } else {
-            if (!item.name.isEmpty() && !item.path.isEmpty()) {
-                m_items.append(item);
-            }
-        }
-    }
+    m_items = readArrayRecursive(s, size);
     s.endArray();
     rebuildButtons();
 }
@@ -1100,34 +1316,6 @@ void ShortcutBar::saveToSettings() const {
     QSettings s(kSettingsOrg, kSettingsApp);
     s.remove("shortcuts");
     s.beginWriteArray("shortcuts", m_items.size());
-    for (int i = 0; i < m_items.size(); ++i) {
-        s.setArrayIndex(i);
-        const auto& it = m_items[i];
-        s.setValue("name", it.name);
-        s.setValue("path", it.path);
-        s.setValue("type", it.type);
-        s.setValue("isFolder", it.isFolder);
-        s.setValue("expanded", it.expanded);
-        if (!it.isFolder) {
-            // 凭证仅在快捷方式上才有意义；密码混淆后写盘
-            s.setValue("username",     it.username);
-            s.setValue("password_obf", obfuscate(it.password));
-            s.setValue("workgroup",    it.workgroup);
-        }
-        if (it.isFolder) {
-            s.beginWriteArray("children", it.children.size());
-            for (int j = 0; j < it.children.size(); ++j) {
-                s.setArrayIndex(j);
-                const auto& c = it.children[j];
-                s.setValue("name", c.name);
-                s.setValue("path", c.path);
-                s.setValue("type", c.type);
-                s.setValue("username",     c.username);
-                s.setValue("password_obf", obfuscate(c.password));
-                s.setValue("workgroup",    c.workgroup);
-            }
-            s.endArray();
-        }
-    }
+    writeArrayRecursive(s, m_items);
     s.endArray();
 }

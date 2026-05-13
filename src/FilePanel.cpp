@@ -204,6 +204,25 @@ void FilePanel::createTab(const QString& path) {
     // ★ 最后一步 —— 统一入口回填 tab 标题和路径栏文本，以 fileList 的真实
     //   currentPath 为准（而非参数 `path`，保险起见）。
     syncPathUI(index, tab.fileList->currentPath());
+
+    // 新 tab 的 fileList 立刻继承当前面板的 active 状态——避免新建 tab 后
+    // 高亮色没跟上 active 状态的问题。
+    tab.fileList->setActiveHighlight(m_active, m_accentColor);
+}
+
+void FilePanel::setActive(bool active) {
+    // 注意：不能用 `if (m_active == active) return;` 早返回守卫——
+    // 因为 m_active 默认 false，启动时把"非激活面板"setActive(false) 会被
+    // 误判为 no-op，导致那一侧 fileList 从未应用过 stylesheet，落回 MainWindow
+    // 全局表的 Nord Frost 蓝高亮。让每次调用都强制下发样式，幂等且廉价。
+    m_active = active;
+    // 把 active 状态广播到所有 tab 的 fileList——切 tab 时新 tab 也要保持
+    // 一致的高亮色（不 active 就是透明）。
+    for (auto& tab : m_tabs) {
+        if (tab.fileList) {
+            tab.fileList->setActiveHighlight(active, m_accentColor);
+        }
+    }
 }
 
 void FilePanel::navigateTo(const QString& path) {

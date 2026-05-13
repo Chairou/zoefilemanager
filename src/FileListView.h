@@ -46,6 +46,12 @@ public:
     bool selectByPath(const QString& path);
     const QVector<FileEntry>& entries() const { return m_entries; }
 
+    /// 设置当前视图的"激活高亮"状态。
+    /// - active=true：用 accent 色作为选中行底色（左面板=黄/右面板=绿）。
+    /// - active=false：选中行底色变透明，让用户一眼看出"焦点不在我这边"。
+    /// 颜色由上层（FilePanel）按 panel side 注入，避免本类知道左右色板。
+    void setActiveHighlight(bool active, const QColor& accent);
+
 signals:
     void directoryActivated(const QString& path);  // 双击目录
     /// 双击的是已识别的压缩包（.zip / .tar.gz / .tgz / .tar.bz2 / .tbz /
@@ -97,6 +103,12 @@ private:
     // 会先把它单独选上作为拖拽载荷。
     QPoint m_dragStartPos;
     bool   m_pressOnEntry = false;
+
+    // ---- 激活高亮（左/右面板 active 状态联动）----
+    // 由 FilePanel::setActive 透传 setActiveHighlight 写入；样式表里
+    // QTableWidget::item:selected 的背景色按这两个值动态切换。
+    bool   m_activeHighlight = false;
+    QColor m_activeAccent;            // 当前 accent 色（默认未设）
 };
 
 #endif // FILELISTVIEW_H

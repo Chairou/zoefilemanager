@@ -17,6 +17,7 @@
 #include <QMimeData>
 #include <QPainter>
 #include <QPixmap>
+#include <QPalette>
 #include <algorithm>
 
 // 同应用 drag 标识本应用自己产生的拖拽数据，让 drop 端可以保留 SFTP URL 等
@@ -445,6 +446,99 @@ void FileListView::updateRowSelection(int row, bool selected) {
             it->setSelected(selected);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 激活高亮：active 时把 selected 行底色改为 accent（带 alpha），
+// 非 active 时让 selected 行视觉上完全等同于未选中行（清洁视图）。
+//
+// 实现走 stylesheet 而非 QPalette：QPalette 在 macOS 系统主题下经常被原生
+// 样式覆盖；项目其余处也都是 stylesheet 路线，与之保持一致更稳。
+//
+// 注意：本表 setSelectionMode(NoSelection) + 自管 isSelected()，所以
+// QTableWidget::item:selected 是我们自己 setSelected(true) 触发的，
+// stylesheet 选择器照常生效。
+//
+// 非激活方案：把 :selected 规则的 background-color 设成 transparent，
+// 并显式 reset color/font-weight 等可能被全局样式带上的属性。文字色不
+// 写死成某个值，让每行 setForeground 设的"文件类型色"（目录蓝/代码绿/
+// 配置黄等）原样透出 —— 这样选中行和未选中行外观完全一致，达到"清洁
+// 窗口"效果。注意 :hover 也要保持透明，避免鼠标在非激活面板上掠过时
+// 闪出蓝色 hover 条。
+// ---------------------------------------------------------------------------
+void FileListView::setActiveHighlight(bool active, const QColor& accent) {
+    m_activeHighlight = active;
+    m_activeAccent = accent;
+
+    // -----------------------------------------------------------------------
+    // 关键：MainWindow 全局 stylesheet 里 `QTableWidget::item:selected` 用了
+    // rgba(136,192,208,0.28) 硬编码 Frost 蓝，并且还有属性级
+    // `selection-background-color: rgba(136,192,208,0.25)`。
+    //
+    // 之前用同样的 `QTableWidget::item:selected` 选择器去覆盖，**特异性相同**，
+    // 在 Qt 的 stylesheet 级联里全局规则可能赢；同时 QPalette::Highlight 还
+    // 是另一条独立通道，stylesheet 的 :selected 也未必能阻止 QStyle 走 palette。
+    //
+    // 三管齐下确保非激活面板真的没有任何选中视觉：
+    //   1) 选择器升级为 `FileListView::item:selected` —— 类名级特异性高于
+    //      `QTableWidget::item:selected`，必赢全局规则。
+    //   2) 同时写属性级 `selection-background-color` / `selection-color`，
+    //      压住全局表里的同名属性。
+    //   3) 直接改 QPalette::Highlight，覆盖 macOS 原生 QStyle 绘制路径。
+    // -----------------------------------------------------------------------
+    QString css;
+    QPalette pal = palette();
+    if (active && accent.isValid()) {
+        // 28% 不透明度的 accent 色
+        QColor sel = accent;
+        sel.setAlphaF(0.28);
+        css = QString(
+            "FileListView {"
+            "  selection-background-color: rgba(%1, %2, %3, %4);"
+            "  selection-color: #ECEFF4;"
+            "}"
+            "FileListView::item:selected {"
+            "  background-color: rgba(%1, %2, %3, %4);"
+            "  color: #ECEFF4;"
+            "}"
+            "FileListView::item:selected:!active {"
+            "  background-color: rgba(%1, %2, %3, %4);"
+            "  color: #ECEFF4;"
+            "}")
+            .arg(sel.red()).arg(sel.green()).arg(sel.blue()).arg(sel.alpha());
+        pal.setColor(QPalette::Highlight, sel);
+        pal.setColor(QPalette::HighlightedText, QColor("#ECEFF4"));
+        // macOS 失焦态用的 Inactive group 也要同色，避免切窗口后回到默认蓝
+        pal.setColor(QPalette::Inactive, QPalette::Highlight, sel);
+        pal.setColor(QPalette::Inactive, QPalette::HighlightedText, QColor("#ECEFF4"));
+    } else {
+        // 非 active：完全清掉选中视觉。background 透明 + 文字色不写死，让
+        // setForeground 设的"文件类型色"原样透出。hover 也压成透明。
+        css = QStringLiteral(
+            "FileListView {"
+            "  selection-background-color: transparent;"
+            "}"
+            "FileListView::item:selected {"
+            "  background-color: transparent;"
+            "}"
+            "FileListView::item:selected:!active {"
+            "  background-color: transparent;"
+            "}"
+            "FileListView::item:hover {"
+            "  background-color: transparent;"
+            "}");
+        // QPalette 把 Highlight 设成透明（alpha=0），从根上不让 QStyle 画蓝条
+        QColor transp(0, 0, 0, 0);
+        pal.setColor(QPalette::Highlight, transp);
+        pal.setColor(QPalette::Inactive, QPalette::Highlight, transp);
+        // HighlightedText 设回普通文字色，避免选中时强制变白覆盖文件类型色
+        pal.setColor(QPalette::HighlightedText, QColor("#D8DEE9"));
+        pal.setColor(QPalette::Inactive, QPalette::HighlightedText, QColor("#D8DEE9"));
+    }
+    setPalette(pal);
+    setStyleSheet(css);
+    // 强制 viewport 重绘，避免 QStyle 缓存导致延迟更新
+    if (viewport()) viewport()->update();
 }
 
 QVector<FileEntry> FileListView::getSelectedEntries() const {

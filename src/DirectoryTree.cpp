@@ -69,6 +69,9 @@ DirectoryTree::DirectoryTree(QWidget* parent)
     connect(this, &QTreeWidget::itemExpanded, this, &DirectoryTree::onItemExpanded);
 
     buildTree();
+
+    // 初始按 m_activeSide（默认 Left=黄）应用选择条配色，避免出现全局蓝。
+    applyActiveAccentStyle();
 }
 
 void DirectoryTree::buildTree() {
@@ -224,10 +227,17 @@ void DirectoryTree::highlightPath(const QString& rawPath, PanelSide side) {
         m_rightHighlight = path;
     }
 
-    // Apply highlight
+    // Apply highlight。规则：左右两侧的目标若是同一项，
+    // 按 m_activeSide 取色（active tab 的颜色优先），保证目录树与 tab 颜色一致；
+    // 否则各自按本侧颜色着色。
     if (m_pathToItem.contains(path)) {
         QTreeWidgetItem* item = m_pathToItem[path];
-        QColor color = (side == PanelSide::Left) ? m_leftColor : m_rightColor;
+        const bool sameAsOther = (side == PanelSide::Left)
+            ? (m_rightHighlight == path)
+            : (m_leftHighlight == path);
+        PanelSide colorSide = side;
+        if (sameAsOther) colorSide = m_activeSide;  // 同一项 → 取 active 侧颜色
+        QColor color = (colorSide == PanelSide::Left) ? m_leftColor : m_rightColor;
         item->setForeground(0, QBrush(color));
         QFont font = item->font(0);
         font.setBold(true);
@@ -239,12 +249,68 @@ void DirectoryTree::clearHighlight(PanelSide side) {
     QString& highlight = (side == PanelSide::Left) ? m_leftHighlight : m_rightHighlight;
     if (!highlight.isEmpty() && m_pathToItem.contains(highlight)) {
         QTreeWidgetItem* item = m_pathToItem[highlight];
-        item->setForeground(0, QBrush());
-        QFont font = item->font(0);
-        font.setBold(false);
-        item->setFont(0, font);
+        // 若该项仍被另一侧持有，则不要清掉颜色，只是把本侧 highlight key 置空，
+        // 然后按对侧颜色重染（避免单侧 clear 把"另一侧仍指向该项"的高亮也擦掉）。
+        const PanelSide other = (side == PanelSide::Left) ? PanelSide::Right : PanelSide::Left;
+        const QString& otherKey = (other == PanelSide::Left) ? m_leftHighlight : m_rightHighlight;
+        if (otherKey == highlight) {
+            QColor color = (other == PanelSide::Left) ? m_leftColor : m_rightColor;
+            item->setForeground(0, QBrush(color));
+            // bold 保持
+        } else {
+            item->setForeground(0, QBrush());
+            QFont font = item->font(0);
+            font.setBold(false);
+            item->setFont(0, font);
+        }
     }
     highlight.clear();
+}
+
+void DirectoryTree::setActiveSide(PanelSide side) {
+    if (m_activeSide == side) return;
+    m_activeSide = side;
+    // 当左右指向同一项时，按新 active 侧颜色重新染该项。
+    if (!m_leftHighlight.isEmpty() && m_leftHighlight == m_rightHighlight
+        && m_pathToItem.contains(m_leftHighlight)) {
+        QTreeWidgetItem* item = m_pathToItem[m_leftHighlight];
+        QColor color = (side == PanelSide::Left) ? m_leftColor : m_rightColor;
+        item->setForeground(0, QBrush(color));
+        QFont font = item->font(0);
+        font.setBold(true);
+        item->setFont(0, font);
+    }
+    // 让"选择条"的背景色跟随激活侧（黄/绿），与 tab 颜色保持一致
+    applyActiveAccentStyle();
+}
+
+// =============================================================================
+// applyActiveAccentStyle —— 按 m_activeSide 刷新选择条背景色
+//
+// 背景：MainWindow 全局样式表把 QTreeWidget::item:selected 的背景固定成
+// Nord 蓝（rgba(136,192,208,0.28)）。而我们希望目录树的"选择条"颜色与
+// 当前激活的 tab 同色（左=黄 #EBCB8B / 右=绿 #A3BE8C）。
+//
+// 做法：在本控件局部 setStyleSheet —— Qt 局部样式优先于全局，把
+// item:selected / item:selected:!active（失焦时仍保持选中色）覆盖。
+// 用 rgba(0.28) 透明度匹配原视觉密度，避免太刺眼。
+// =============================================================================
+void DirectoryTree::applyActiveAccentStyle() {
+    QColor base = (m_activeSide == PanelSide::Left) ? m_leftColor : m_rightColor;
+    // 选择条背景：accent 色 + 28% 透明度（与原蓝色密度一致）
+    QString selBg = QString("rgba(%1, %2, %3, 0.28)")
+                        .arg(base.red()).arg(base.green()).arg(base.blue());
+    // hover：accent 色 + 10% 透明度
+    QString hoverBg = QString("rgba(%1, %2, %3, 0.10)")
+                          .arg(base.red()).arg(base.green()).arg(base.blue());
+
+    setStyleSheet(QString(
+        "QTreeWidget { background-color: #2E3440; color: #D8DEE9; border: 1px solid #434C5E; outline: 0; }"
+        "QTreeWidget::item { padding: 3px 4px; border: none; }"
+        "QTreeWidget::item:hover { background-color: %1; }"
+        "QTreeWidget::item:selected { background-color: %2; color: #ECEFF4; }"
+        "QTreeWidget::item:selected:!active { background-color: %2; color: #ECEFF4; }"
+    ).arg(hoverBg, selBg));
 }
 
 void DirectoryTree::expandToPath(const QString& rawPath) {

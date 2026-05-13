@@ -33,7 +33,15 @@ public:
     void buildTree();    // 清空 + 从根 "/" 重新构建初始两层
     void highlightPath(const QString& path, PanelSide side);   // 蓝/绿色高亮
     void clearHighlight(PanelSide side);
+
+    /// 按当前 m_activeSide 的 accent（左黄/右绿）刷新 QTreeWidget::item:selected
+    /// 的背景色——保证目录树"选择条"颜色与激活 tab 颜色一致。
+    void applyActiveAccentStyle();
     void expandToPath(const QString& path);   // 把所有祖先节点展开（懒加载触发）
+
+    /// 切换 active 面板时调用：当左右高亮指向同一项时，会按 active 侧颜色
+    /// 重新着色（避免被另一侧颜色"覆盖"，让目录树颜色与 active tab 颜色一致）。
+    void setActiveSide(PanelSide side);
 
     /// 面板激活时调用：展开到 path 对应项、滚动到视图中心、setCurrentItem。
     /// 远程/不在树中的路径静默跳过。不会触发 directorySelected 信号。
@@ -73,6 +81,7 @@ private:
     QMap<QString, QTreeWidgetItem*> m_pathToItem;  // 反查：路径 → 树节点
     QString m_leftHighlight;
     QString m_rightHighlight;
+    PanelSide m_activeSide = PanelSide::Left;  // 决定左右指向同一项时显示谁的颜色
     // ROLLBACK: 左侧原为天蓝 #4FC3F7 (QColor(79, 195, 247))。如需回滚把
     // 下一行换回：QColor m_leftColor{79, 195, 247};
     QColor m_leftColor{235, 203, 139};   // #EBCB8B 左面板 Nord aurora 黄
