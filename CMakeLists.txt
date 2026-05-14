@@ -173,19 +173,30 @@ if(APPLE)
             #   (b) right after macdeployqt finishes, delete the unused
             #       plugins it copied in (libqpdf, libqtvirtualkeyboardplugin)
             #       so the bundle doesn't carry dead-link dylibs at runtime.
+            #
+            # On big bundles (SMB pulls in ~100 samba private dylibs) this
+            # step can run for 2-5 minutes. Without live output users
+            # often think the build has hung. We therefore:
+            #   - run macdeployqt with stdbuf -oL -eL (line-buffered) so
+            #     no chunk gets stuck inside libc's stdio buffer,
+            #   - tee the full output to build-dir/macdeployqt.log
+            #     (always available for `tail -f`),
+            #   - print a 1-line heartbeat every 5s while it runs, so the
+            #     terminal NEVER goes silent for more than 5s,
+            #   - filter only the terminal display, never the log file,
+            #   - skip macdeployqt entirely on incremental rebuilds via
+            #     a sentinel file inside the bundle (delete the bundle
+            #     or the sentinel to force a full re-deploy).
+            set(_macdeploy_log "${CMAKE_BINARY_DIR}/macdeployqt.log")
             add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E echo
-                    "Running macdeployqt (non-fatal: optional-module rpath warnings are expected)"
                 COMMAND sh -c
-                    "{ '${MACDEPLOYQT_EXECUTABLE}' '$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>' -verbose=1 -no-strip '-codesign=-' 2>&1 || echo 'macdeployqt reported errors; continuing — final sign happens in deploy_macos.cmake'; } | grep -v -E 'Cannot resolve rpath \"@rpath/Qt(Pdf|VirtualKeyboard|VirtualKeyboardQml)\\.framework' | grep -v -E '^ERROR:  using QList\\(\"/opt/homebrew' || true"
-                COMMAND sh -c
-                    "rm -f '$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/PlugIns/imageformats/libqpdf.dylib' '$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/PlugIns/platforminputcontexts/libqtvirtualkeyboardplugin.dylib' && rmdir '$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/PlugIns/platforminputcontexts' 2>/dev/null; true"
-                COMMAND ${CMAKE_COMMAND} -E echo
-                    "Pruned unused Qt plugins (libqpdf, libqtvirtualkeyboardplugin)"
+                    "BUNDLE='$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>'; SENTINEL=\"$BUNDLE/Contents/.macdeployqt.done\"; if [ -f \"$SENTINEL\" ]; then echo \"macdeployqt: bundle already deployed (sentinel: $SENTINEL) — skipping. Delete the bundle or that file to force a full re-deploy.\"; exit 0; fi; LOG='${_macdeploy_log}'; FW=\"$BUNDLE/Contents/Frameworks\"; SB=$(command -v stdbuf || command -v gstdbuf || true); SBARGS=''; [ -n \"$SB\" ] && SBARGS='-oL -eL'; echo \"Running macdeployqt (first time can take 2-5 min on a big bundle; full log: $LOG)\"; : > \"$LOG\"; ( $SB $SBARGS '${MACDEPLOYQT_EXECUTABLE}' \"$BUNDLE\" -verbose=1 -no-strip '-codesign=-' 2>&1 || echo \"macdeployqt reported errors; continuing — final sign happens in deploy_macos.cmake\" ) | tee \"$LOG\" | grep --line-buffered -v -E 'Cannot resolve rpath \"@rpath/Qt[A-Za-z]+\\.framework' | grep --line-buffered -v -E 'Cannot resolve rpath \"@rpath/lib[^\"]+\\.dylib\"' | grep --line-buffered -v -E '^ERROR:  using QList\\(\"' | grep --line-buffered -v -E '^ERROR: \"error: .*otool-classic: can'\\''t open file' | grep --line-buffered -v -E '^ERROR: Codesign signing error:' | grep --line-buffered -v -E '^ERROR: \"/.*\\.dylib: No such file or directory' & MDPID=$!; while kill -0 $MDPID 2>/dev/null; do sleep 5; n=$(ls \"$FW\" 2>/dev/null | wc -l | tr -d ' '); printf '  ... macdeployqt working: %s frameworks/dylibs in bundle so far\\n' \"$n\"; done; wait $MDPID; rm -f \"$BUNDLE/Contents/PlugIns/imageformats/libqpdf.dylib\" \"$BUNDLE/Contents/PlugIns/platforminputcontexts/libqtvirtualkeyboardplugin.dylib\"; rmdir \"$BUNDLE/Contents/PlugIns/platforminputcontexts\" 2>/dev/null; echo 'Pruned unused Qt plugins (libqpdf, libqtvirtualkeyboardplugin)'; true"
                 COMMAND ${CMAKE_COMMAND}
                     -DBUNDLE=$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>
                     -DLIBSSH2_SRC=${LIBSSH2_LIBRARY}
                     -P "${_deploy_script}"
+                COMMAND sh -c
+                    "touch '$<TARGET_BUNDLE_DIR:${PROJECT_NAME}>/Contents/.macdeployqt.done'"
                 COMMENT "Embedding Qt frameworks + libssh2 into the .app bundle"
                 VERBATIM
             )

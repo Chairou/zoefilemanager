@@ -28,6 +28,60 @@ endif()
 set(FRAMEWORKS_DIR "${BUNDLE}/Contents/Frameworks")
 file(MAKE_DIRECTORY "${FRAMEWORKS_DIR}")
 
+# ---- Homebrew dylib search paths --------------------------------------
+# Samba ships many "private" dylibs under <prefix>/Cellar/samba/<ver>/lib/private/
+# that are NOT on the standard linker search path, but libsmbclient
+# hard-codes references to them via @executable_path/../Frameworks/...
+# We need to be able to locate them on disk so we can vendor them in.
+#
+# Krb5 / tdb / etc. live under their own Cellar dirs too. We GLOB the
+# version directory so a Homebrew upgrade (samba 4.21 -> 4.22, etc.)
+# doesn't silently break the deploy.
+set(_HB_SEARCH_PATHS
+    "/opt/homebrew/lib"
+    "/opt/homebrew/opt/samba/lib"
+    "/opt/homebrew/opt/samba/lib/private"
+    "/opt/homebrew/opt/krb5/lib"
+    "/opt/homebrew/opt/tdb/lib"
+    "/opt/homebrew/opt/talloc/lib"
+    "/opt/homebrew/opt/tevent/lib"
+    "/opt/homebrew/opt/ldb/lib"
+    "/opt/homebrew/opt/openssl@3/lib"
+    "/opt/homebrew/opt/gnutls/lib"
+    "/opt/homebrew/opt/icu4c@76/lib"
+    "/opt/homebrew/opt/icu4c/lib"
+    "/usr/local/lib"
+)
+# Add versioned Cellar dirs (samba/lib + samba/lib/private, krb5/lib, tdb/lib).
+file(GLOB _hb_samba_dirs    "/opt/homebrew/Cellar/samba/*/lib")
+file(GLOB _hb_samba_priv    "/opt/homebrew/Cellar/samba/*/lib/private")
+file(GLOB _hb_krb5_dirs     "/opt/homebrew/Cellar/krb5/*/lib")
+file(GLOB _hb_tdb_dirs      "/opt/homebrew/Cellar/tdb/*/lib")
+file(GLOB _hb_talloc_dirs   "/opt/homebrew/Cellar/talloc/*/lib")
+file(GLOB _hb_tevent_dirs   "/opt/homebrew/Cellar/tevent/*/lib")
+file(GLOB _hb_ldb_dirs      "/opt/homebrew/Cellar/ldb/*/lib")
+file(GLOB _hb_icu_dirs      "/opt/homebrew/Cellar/icu4c@*/*/lib" "/opt/homebrew/Cellar/icu4c/*/lib")
+# Final fallback: every Cellar/*/lib  (covers any keg-only formula such as
+# icu4c@76, openssl@3, sqlite, etc., even on a different Homebrew prefix)
+file(GLOB _hb_cellar_all    "/opt/homebrew/Cellar/*/*/lib")
+list(APPEND _HB_SEARCH_PATHS
+    ${_hb_samba_dirs} ${_hb_samba_priv}
+    ${_hb_krb5_dirs} ${_hb_tdb_dirs}
+    ${_hb_talloc_dirs} ${_hb_tevent_dirs} ${_hb_ldb_dirs}
+    ${_hb_icu_dirs}
+    ${_hb_cellar_all})
+
+# Helper: find <name> on disk in our Homebrew search paths.
+function(_find_dylib_in_homebrew name out_path)
+    set(${out_path} "" PARENT_SCOPE)
+    foreach(_d IN LISTS _HB_SEARCH_PATHS)
+        if(EXISTS "${_d}/${name}")
+            set(${out_path} "${_d}/${name}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+endfunction()
+
 # Pick an executable inside the bundle — it's the only "main" Mach-O we
 # need to rewrite references on.
 get_filename_component(_app_name "${BUNDLE}" NAME_WE)
@@ -81,6 +135,20 @@ endfunction()
 # Helper: for every non-system dependency of <dylib>, make sure the
 # dependency is vendored too and rewrite <dylib>'s reference to @rpath/...
 function(_rewrite_non_system_deps dylib)
+    # Guard against cycles in the dep graph (samba private libs do form
+    # cycles, e.g. libreplace <-> libsamba-util). We track real, fully-
+    # resolved paths in a GLOBAL property so recursion only walks each
+    # dylib once per cmake -P invocation.
+    get_filename_component(_real_dylib "${dylib}" REALPATH)
+    get_property(_visited GLOBAL PROPERTY _DEPLOY_VISITED_DYLIBS)
+    if(_visited)
+        list(FIND _visited "${_real_dylib}" _idx)
+        if(NOT _idx EQUAL -1)
+            return()
+        endif()
+    endif()
+    set_property(GLOBAL APPEND PROPERTY _DEPLOY_VISITED_DYLIBS "${_real_dylib}")
+
     execute_process(COMMAND otool -L "${dylib}"
         OUTPUT_VARIABLE _out OUTPUT_STRIP_TRAILING_WHITESPACE)
     string(REPLACE "\n" ";" _lines "${_out}")
@@ -102,9 +170,62 @@ function(_rewrite_non_system_deps dylib)
         if(_dep MATCHES "^/usr/lib/" OR _dep MATCHES "^/System/")
             continue()
         endif()
-        # Already rewritten?
+        # If the ref is already in @-form, the standard assumption is "it's
+        # already in the bundle", but Samba's libsmbclient hard-codes
+        # @executable_path/../Frameworks/<libfoo>.dylib for many private
+        # dylibs that live under Cellar/samba/<ver>/lib/private/ and are
+        # NOT picked up automatically. So: verify the target actually
+        # exists in Contents/Frameworks; if it does, skip; if not, hunt
+        # it down in Homebrew, vendor it, and rewrite this ref to
+        # @rpath/<soname> (canonical form) so everything lines up.
         if(_dep MATCHES "^@rpath/" OR _dep MATCHES "^@executable_path/" OR
            _dep MATCHES "^@loader_path/")
+            # Special-case framework references like
+            # @rpath/QtCore.framework/Versions/A/QtCore: extract the
+            # framework path from the @-prefix and check if the framework
+            # is in the bundle. If yes, skip. If no, also skip (we cannot
+            # easily vendor a framework from Homebrew here — macdeployqt
+            # owns that, and missing Qt frameworks are a separate bug).
+            string(REGEX MATCH "([^/]+\\.framework/.+)$" _fwmatch "${_dep}")
+            if(CMAKE_MATCH_1 AND EXISTS "${FRAMEWORKS_DIR}/${CMAKE_MATCH_1}")
+                # Framework binary is in the bundle — nothing to do.
+                continue()
+            endif()
+            if(EXISTS "${FRAMEWORKS_DIR}/${_dep_name}")
+                # Already vendored — but make sure the ref is on the
+                # canonical @rpath/<soname> form to keep things uniform.
+                if(NOT _dep STREQUAL "@rpath/${_dep_name}")
+                    execute_process(COMMAND install_name_tool -change
+                        "${_dep}" "@rpath/${_dep_name}" "${dylib}")
+                endif()
+                continue()
+            endif()
+            # If this is a framework binary ref but the framework is NOT
+            # in the bundle, we cannot rescue it from a flat dylib search
+            # — just warn and move on.
+            if(CMAKE_MATCH_1)
+                message(WARNING
+                    "deploy_macos.cmake: framework dependency '${CMAKE_MATCH_1}' "
+                    "referenced by '${_self_name}' is NOT in the bundle. "
+                    "macdeployqt should have copied it; please re-run with a "
+                    "clean bundle.")
+                continue()
+            endif()
+            # Missing — try to find it in Homebrew.
+            _find_dylib_in_homebrew("${_dep_name}" _hb_path)
+            if(NOT _hb_path)
+                message(WARNING
+                    "deploy_macos.cmake: dependency '${_dep_name}' referenced by "
+                    "'${_self_name}' as '${_dep}' is NOT in the bundle and was "
+                    "NOT found in Homebrew search paths. The .app may fail to "
+                    "launch.")
+                continue()
+            endif()
+            message(STATUS "    rescue: ${_self_name} needs ${_dep_name} (was: ${_dep}) -> vendor from ${_hb_path}")
+            _vendor_dylib("${_hb_path}" _dep_dest _dep_soname)
+            execute_process(COMMAND install_name_tool -change
+                "${_dep}" "@rpath/${_dep_soname}" "${dylib}")
+            _rewrite_non_system_deps("${_dep_dest}")
             continue()
         endif()
         # Non-system dep - vendor it (recursively) and rewrite the ref.
@@ -234,6 +355,57 @@ if(EXISTS "${_qtdbus_fw}" AND NOT EXISTS "${FRAMEWORKS_DIR}/QtDBus.framework/Ver
         "@executable_path/../Frameworks" "${_qtdbus_bin}"
         RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
 endif()
+
+# ---- 4.6) Sweep ALL vendored dylibs for non-system deps. -----------------
+# macdeployqt copies third-party dylibs (e.g. libsmbclient + its samba
+# private dylibs) into the bundle, but it does NOT recursively chase
+# dependencies that are already expressed as @executable_path/...
+# (Samba hard-codes those at link time). Some of those targets live
+# under Cellar/samba/<ver>/lib/private/ and never made it into the
+# bundle, causing dyld "Library not loaded" crashes at launch.
+#
+# Re-walk every dylib we have so far; for each missing dep we now know
+# how to vendor from Homebrew (see _rewrite_non_system_deps + _HB_SEARCH_PATHS).
+# Loop until a full pass adds no new file (handles deep dep chains).
+message(STATUS "Sweeping all vendored dylibs for missing deps (samba private, krb5, tdb, ...)")
+set(_sweep_pass 0)
+while(_sweep_pass LESS 6)
+    math(EXPR _sweep_pass "${_sweep_pass} + 1")
+    # Reset the per-walk "visited" set so this pass re-examines every
+    # dylib (the previous pass may have added new files we still need
+    # to chase deps for).
+    set_property(GLOBAL PROPERTY _DEPLOY_VISITED_DYLIBS "")
+    file(GLOB _all_dylibs "${FRAMEWORKS_DIR}/*.dylib")
+    # ALSO walk every Qt framework binary (e.g. QtCore.framework/Versions/A/QtCore).
+    # Without this, dylibs hard-coded as @executable_path/../Frameworks/libfoo
+    # by Qt itself (libglib, libicudata, libharfbuzz, libpng, libfreetype,
+    # libmd4c, libb2, libdouble-conversion, libpcre2-16, libgthread, ...)
+    # would never be rescued, since the sweep would only see standalone
+    # dylibs and not the frameworks that pull them in.
+    file(GLOB _fw_dirs LIST_DIRECTORIES TRUE "${FRAMEWORKS_DIR}/*.framework")
+    set(_all_macho "${_all_dylibs}")
+    foreach(_fw IN LISTS _fw_dirs)
+        file(GLOB _fw_bins "${_fw}/Versions/*/Qt*")
+        foreach(_b IN LISTS _fw_bins)
+            if(NOT IS_SYMLINK "${_b}" AND NOT IS_DIRECTORY "${_b}")
+                list(APPEND _all_macho "${_b}")
+            endif()
+        endforeach()
+    endforeach()
+    list(LENGTH _all_dylibs _before_count)
+    foreach(_f IN LISTS _all_macho)
+        if(NOT IS_SYMLINK "${_f}")
+            execute_process(COMMAND chmod u+w "${_f}" OUTPUT_QUIET ERROR_QUIET)
+            _rewrite_non_system_deps("${_f}")
+        endif()
+    endforeach()
+    file(GLOB _all_dylibs_after "${FRAMEWORKS_DIR}/*.dylib")
+    list(LENGTH _all_dylibs_after _after_count)
+    message(STATUS "  sweep pass ${_sweep_pass}: ${_before_count} -> ${_after_count} dylibs in Frameworks/ (also walked Qt framework binaries)")
+    if(_after_count EQUAL _before_count)
+        break()
+    endif()
+endwhile()
 
 # ---- 5) Re-sign everything we touched.  install_name_tool invalidates
 # Mach-O code signatures (macdeployqt ad-hoc signs, we rewrite, now the
