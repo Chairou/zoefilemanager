@@ -178,6 +178,34 @@ public:
             "• 已填写时以本地混淆形式保存（非强加密），\n"
             "  请勿在共享设备保存敏感账号。"));
 
+        m_keyPathEdit = new QLineEdit();
+        fixWidth(m_keyPathEdit);
+        m_keyPathEdit->setPlaceholderText(T("optional, e.g. ~/.ssh/id_rsa"));
+        m_keyPathEdit->setToolTip(T(
+            "私钥文件路径（可选）。\n"
+            "示例：~/.ssh/id_rsa、/Users/me/.ssh/id_ed25519\n"
+            "支持 RSA/ECDSA/Ed25519 等常用格式。\n"
+            "可点击右侧 \"浏览\" 按钮选择文件。"));
+
+        m_keyBrowseBtn = new QPushButton(T("Browse..."));
+        m_keyBrowseBtn->setFixedWidth(72);
+        auto* keyPathRow = new QHBoxLayout();
+        keyPathRow->setContentsMargins(0, 0, 0, 0);
+        keyPathRow->setSpacing(4);
+        keyPathRow->addWidget(m_keyPathEdit);
+        keyPathRow->addWidget(m_keyBrowseBtn);
+        m_keyPathRowWidget = new QWidget();
+        m_keyPathRowWidget->setLayout(keyPathRow);
+        // 不限制行容器宽度，让输入框(200) + 间距(4) + 按钮(72) 自然展开
+
+        m_passphraseEdit = new QLineEdit();
+        m_passphraseEdit->setEchoMode(QLineEdit::Password);
+        fixWidth(m_passphraseEdit);
+        m_passphraseEdit->setPlaceholderText(T("key passphrase (leave empty if none)"));
+        m_passphraseEdit->setToolTip(T(
+            "私钥的 passphrase（可选，留空表示无加密）。\n"
+            "• 已填写时以本地混淆形式保存（非强加密）。"));
+
         m_remotePathEdit = new QLineEdit();
         fixWidth(m_remotePathEdit);
         m_remotePathEdit->setPlaceholderText("/data/work");
@@ -247,6 +275,8 @@ public:
         m_form->addRow(new QLabel(T("Port:")),     m_portSpin);
         m_form->addRow(new QLabel(T("Username:")), m_userEdit);
         m_form->addRow(new QLabel(T("Password:")), m_pwdEdit);
+        m_form->addRow(new QLabel(T("Key file:")), m_keyPathRowWidget);
+        m_form->addRow(new QLabel(T("Passphrase:")), m_passphraseEdit);
         m_form->addRow(new QLabel(T("Path:")),     m_remotePathEdit);
         m_form->addRow(new QLabel(T("Host:")),     m_smbHostEdit);
         m_form->addRow(new QLabel(T("Share:")),    m_smbShareEdit);
@@ -273,6 +303,15 @@ public:
             if (!dir.isEmpty()) m_localPathEdit->setText(dir);
         });
 
+        connect(m_keyBrowseBtn, &QPushButton::clicked, this, [this]() {
+            QString start = m_keyPathEdit->text().trimmed();
+            if (start.startsWith("~/")) start = QDir::homePath() + start.mid(1);
+            QString file = QFileDialog::getOpenFileName(this, T("Select private key"),
+                                                       start,
+                                                       T("Private key files (*);;All files (*)"));
+            if (!file.isEmpty()) m_keyPathEdit->setText(file);
+        });
+
         connect(m_typeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
                 this, [this](int) { applyTypeUI(); });
 
@@ -291,9 +330,13 @@ public:
     // 因此与 path 分离）。在构造之后、exec() 之前调用即可。
     void setCredentials(const QString& username,
                         const QString& password,
-                        const QString& workgroup) {
+                        const QString& workgroup,
+                        const QString& privateKeyPath = QString(),
+                        const QString& passphrase = QString()) {
         m_userEdit   ->setText(username);
         m_pwdEdit    ->setText(password);
+        m_keyPathEdit->setText(privateKeyPath);
+        m_passphraseEdit->setText(passphrase);
         m_smbUserEdit->setText(username);
         m_smbPwdEdit ->setText(password);
         m_smbWorkgroupEdit->setText(workgroup);
@@ -314,6 +357,12 @@ public:
     }
     QString workgroup() const {
         return (type() == "smb") ? m_smbWorkgroupEdit->text().trimmed() : QString();
+    }
+    QString privateKeyPath() const {
+        return (type() == "sftp") ? m_keyPathEdit->text().trimmed() : QString();
+    }
+    QString passphrase() const {
+        return (type() == "sftp") ? m_passphraseEdit->text() : QString();  // 不 trim，passphrase 可能含尾随空格
     }
 
     QString name() const {
@@ -406,6 +455,8 @@ private:
         setRowVisible(m_portSpin,        sftp);
         setRowVisible(m_userEdit,        sftp);
         setRowVisible(m_pwdEdit,         sftp);
+        setRowVisible(m_keyPathRowWidget, sftp);
+        setRowVisible(m_passphraseEdit,  sftp);
         setRowVisible(m_remotePathEdit,  sftp);
 
         setRowVisible(m_smbHostEdit,      smb);
@@ -496,6 +547,10 @@ private:
     QSpinBox*    m_portSpin;
     QLineEdit*   m_userEdit;
     QLineEdit*   m_pwdEdit;
+    QWidget*     m_keyPathRowWidget;
+    QLineEdit*   m_keyPathEdit;
+    QPushButton* m_keyBrowseBtn;
+    QLineEdit*   m_passphraseEdit;
     QLineEdit*   m_remotePathEdit;
 
     // smb
@@ -1078,7 +1133,8 @@ void ShortcutBar::editAtPath(const QVector<int>& path) {
         rebuildButtons();
     } else {
         AddShortcutDialog dlg(this, node->type, node->name, node->path);
-        dlg.setCredentials(node->username, node->password, node->workgroup);
+        dlg.setCredentials(node->username, node->password, node->workgroup,
+                           node->privateKeyPath, node->passphrase);
         if (dlg.exec() != QDialog::Accepted) return;
         QString err;
         if (!validatePath(dlg.type(), dlg.path(), &err)) {
@@ -1091,6 +1147,8 @@ void ShortcutBar::editAtPath(const QVector<int>& path) {
         node->username  = dlg.username();
         node->password  = dlg.password();
         node->workgroup = dlg.workgroup();
+        node->privateKeyPath = dlg.privateKeyPath();
+        node->passphrase = dlg.passphrase();
         saveToSettings();
         rebuildButtons();
     }
@@ -1121,6 +1179,8 @@ void ShortcutBar::addShortcutUnder(const QVector<int>& folderPath) {
     child.username  = dlg.username();
     child.password  = dlg.password();
     child.workgroup = dlg.workgroup();
+    child.privateKeyPath = dlg.privateKeyPath();
+    child.passphrase = dlg.passphrase();
     child.isFolder  = false;
     level->append(child);
     if (folderNode) folderNode->expanded = true;
@@ -1235,6 +1295,8 @@ static QVector<ShortcutItem> readArrayRecursive(QSettings& s, int size) {
         item.username = s.value("username").toString();
         item.password = deobfuscate(s.value("password_obf").toString());
         item.workgroup= s.value("workgroup").toString();
+        item.privateKeyPath = s.value("privateKeyPath").toString();
+        item.passphrase = deobfuscate(s.value("passphrase_obf").toString());
 
         if (item.isFolder) {
             const int childCount = s.beginReadArray("children");
@@ -1266,6 +1328,8 @@ static void writeArrayRecursive(QSettings& s, const QVector<ShortcutItem>& items
             s.setValue("username",     it.username);
             s.setValue("password_obf", obfuscate(it.password));
             s.setValue("workgroup",    it.workgroup);
+            s.setValue("privateKeyPath", it.privateKeyPath);
+            s.setValue("passphrase_obf", obfuscate(it.passphrase));
         } else {
             // folder 写 children 子数组（即使为空也写，便于 reload 时清晰）
             s.beginWriteArray("children", it.children.size());

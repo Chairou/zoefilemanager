@@ -1737,6 +1737,8 @@ bool MainWindow::ensureRemoteMountedFor(const ShortcutItem& item, QString* outNa
         conn.port     = port;
         conn.username = effectiveUser;
         conn.password = item.password;
+        conn.privateKeyPath = item.privateKeyPath;
+        conn.passphrase = item.passphrase;
 
         statusBar()->showMessage(QString("Connecting to %1 …").arg(mount));
         QApplication::processEvents();

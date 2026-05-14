@@ -42,6 +42,9 @@ struct ShortcutItem {
     QString username;                   // sftp/smb 用
     QString password;                   // sftp/smb 用
     QString workgroup;                  // smb 专用（AD 域名，留空 = WORKGROUP）
+    // SFTP 专用：私钥文件登录
+    QString privateKeyPath;             // sftp 用：私钥文件路径（优先于密码认证）
+    QString passphrase;                 // sftp 用：私钥的 passphrase（可选）
     bool    isFolder = false;
     bool    expanded = true;            // 仅 isFolder=true 时有效
     /// 仅 isFolder=true 时有效；可以同时包含叶子（local/sftp/smb）和嵌套快捷目录。
