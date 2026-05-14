@@ -375,12 +375,21 @@ void FilePanel::onCloseTab(int index) {
     if (m_tabs.size() <= 1) return;  // Don't close last tab
     if (index < 0 || index >= m_tabs.size()) return;
 
+    // ★ 关键：先从 m_tabs 摘除数据 + 切走当前 tab，再删 widget。
+    //   否则 delete w 后若触发 currentChanged → setActiveHighlight
+    //   会访问已被 delete 的 tab.fileList（SIGSEGV）。
+    m_tabs.removeAt(index);
+    if (m_tabBar->currentIndex() == index) {
+        // 把当前索引前移到相邻的合法 tab，避免在已删位置停留
+        const int newIdx = qMax(0, index - 1);
+        m_tabBar->setCurrentIndex(newIdx);
+    }
+    m_tabBar->removeTab(index);
+
     QWidget* w = m_stack->widget(index);
     m_stack->removeWidget(w);
-    delete w;
+    delete w;   // container/children 的 delete 现在是安全的
 
-    m_tabBar->removeTab(index);
-    m_tabs.removeAt(index);
     updateTabColor();
 }
 
