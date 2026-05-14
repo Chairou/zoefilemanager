@@ -25,6 +25,7 @@
 
 #include "Types.h"
 #include "SmbClient.h"
+#include "SftpClient.h"
 #include <QString>
 #include <QVector>
 #include <QStringList>
@@ -80,6 +81,54 @@ public:
     bool               exists(const QString& path);
     QString            normalizePath(const QString& path) const;
 
+    // ----- 文件操作（远程派发；本地走 RealFileSystem）-----
+    /**
+     * 递归删除（文件或目录）。本地走 RealFileSystem::deleteDirectoryWithProgress(无回调)；
+     * 远程走 SftpClient::removeRecursive。SMB 暂未实现，返回 false 并设错。
+     */
+    bool removePath(const QString& path);
+    /**
+     * 重命名 / 移动（同一父目录下改名 或 跨目录移动；不可跨 mount）。
+     * SMB 暂未实现。
+     */
+    bool renamePath(const QString& oldPath, const QString& newPath);
+    /**
+     * 远程↔远程同 mount 内复制；本地↔本地交给 RealFileSystem。
+     * 跨 mount / 跨本地远程边界返回 false 并设错（上层应分情况处理）。
+     */
+    bool copyPath(const QString& srcPath, const QString& dstPath);
+
+    /**
+     * 跨"本地↔SFTP"边界传输（路由自动判方向）：
+     *   - local → sftp(mount)：调 SftpClient::uploadRecursive
+     *   - sftp(mount) → local：调 SftpClient::downloadRecursive
+     *   - 其它（同侧、跨不同远程 mount、SMB 任一侧）：返回 false 并设错
+     *
+     * progress 接的是 byte-level 进度（见 SftpClient::TransferProgressFn），
+     * 调用方负责预扫 bytesTotal（本地端用 SftpClient::localTotalBytes，远端
+     * 用 mount 对应 SftpClient::remoteTotalBytes 或更上层缓存）。
+     * bytesDone 指针在多次调用之间共享，可串起多个条目的累计进度。
+     */
+    bool transferAcross(const QString& srcPath, const QString& dstPath,
+                        const SftpClient::TransferProgressFn& progress,
+                        qint64 bytesTotal,
+                        qint64* bytesDone);
+
+    /**
+     * 预扫 path 下递归字节总量。
+     *   - 本地：QFileInfo + QDir 累加
+     *   - SFTP：调用对应 mount 的 SftpClient::remoteTotalBytes
+     *   - SMB：返回 0（暂未实现）
+     * 用于驱动跨边界传输的进度条上限。
+     */
+    qint64 totalBytes(const QString& path);
+
+    /// 是否在同一个 mount 下（用于判断是否能走 server-side copy/move）
+    bool sameMount(const QString& a, const QString& b) const;
+
+    /// 最近一次 router 级操作错误（远程错误来自下层 client）
+    QString lastError() const { return m_lastError; }
+
     /// 把"显示隐藏文件"开关广播到本地与所有远端后端
     void setShowHidden(bool show);
 
@@ -103,6 +152,8 @@ private:
     // 但 std::unique_ptr<...> 不可拷贝，会导致编译错误。
     std::unordered_map<std::string, std::unique_ptr<SftpClient>> m_mounts;
     std::unordered_map<std::string, std::unique_ptr<SmbClient>>  m_smbMounts;
+
+    mutable QString m_lastError;
 };
 
 #endif // FILESYSTEMROUTER_H

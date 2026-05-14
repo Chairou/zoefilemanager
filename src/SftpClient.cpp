@@ -14,6 +14,8 @@
 #include <QFileInfo>
 #include <QByteArray>
 #include <QDateTime>
+#include <QFile>
+#include <QDir>
 
 #include <algorithm>
 
@@ -438,4 +440,480 @@ bool SftpClient::exists(const QString& remotePath) {
     LIBSSH2_SFTP_ATTRIBUTES a;
     QByteArray p = remotePath.toUtf8();
     return libssh2_sftp_stat(m_sftp, p.constData(), &a) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// 增/删/改 —— 都是 libssh2_sftp_* 的薄封装；失败时翻译错误码到 lastError()
+// ---------------------------------------------------------------------------
+bool SftpClient::removeFile(const QString& remotePath) {
+    if (!m_sftp) { setError("SFTP channel not open"); return false; }
+    QByteArray p = remotePath.toUtf8();
+    int rc = libssh2_sftp_unlink(m_sftp, p.constData());
+    if (rc != 0) {
+        setError(QString("unlink(%1) failed: %2").arg(remotePath, sessionError()));
+        return false;
+    }
+    return true;
+}
+
+bool SftpClient::removeEmptyDirectory(const QString& remotePath) {
+    if (!m_sftp) { setError("SFTP channel not open"); return false; }
+    QByteArray p = remotePath.toUtf8();
+    int rc = libssh2_sftp_rmdir(m_sftp, p.constData());
+    if (rc != 0) {
+        setError(QString("rmdir(%1) failed: %2").arg(remotePath, sessionError()));
+        return false;
+    }
+    return true;
+}
+
+bool SftpClient::removeRecursive(const QString& remotePath) {
+    if (!m_sftp) { setError("SFTP channel not open"); return false; }
+
+    // 先 stat 判断类型；不存在直接当成功（幂等）
+    LIBSSH2_SFTP_ATTRIBUTES a;
+    QByteArray p = remotePath.toUtf8();
+    if (libssh2_sftp_stat(m_sftp, p.constData(), &a) != 0) {
+        return true;  // 不存在视为已删
+    }
+    bool isDir = (a.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS)
+              && LIBSSH2_SFTP_S_ISDIR(a.permissions);
+    if (!isDir) {
+        return removeFile(remotePath);
+    }
+
+    // 目录：临时关掉 hidden 过滤，确保 . 开头的项也能被列出来
+    bool savedHidden = m_showHidden;
+    m_showHidden = true;
+    auto kids = listDirectory(remotePath);
+    m_showHidden = savedHidden;
+
+    for (const auto& e : kids) {
+        // listDirectory 返回的 e.path 已经是 joinRemotePath(remotePath, name)
+        if (!removeRecursive(e.path)) return false;
+    }
+    return removeEmptyDirectory(remotePath);
+}
+
+bool SftpClient::renamePath(const QString& oldRemotePath,
+                            const QString& newRemotePath) {
+    if (!m_sftp) { setError("SFTP channel not open"); return false; }
+    QByteArray a = oldRemotePath.toUtf8();
+    QByteArray b = newRemotePath.toUtf8();
+    int rc = libssh2_sftp_rename(m_sftp, a.constData(), b.constData());
+    if (rc != 0) {
+        setError(QString("rename(%1 -> %2) failed: %3")
+                 .arg(oldRemotePath, newRemotePath, sessionError()));
+        return false;
+    }
+    return true;
+}
+
+bool SftpClient::makeDirectory(const QString& remotePath) {
+    if (!m_sftp) { setError("SFTP channel not open"); return false; }
+    QByteArray p = remotePath.toUtf8();
+    // 0755（rwxr-xr-x）：和大多数 sftp/ssh 客户端默认一致
+    long mode = LIBSSH2_SFTP_S_IRWXU
+              | LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IXGRP
+              | LIBSSH2_SFTP_S_IROTH | LIBSSH2_SFTP_S_IXOTH;
+    int rc = libssh2_sftp_mkdir(m_sftp, p.constData(), mode);
+    if (rc != 0) {
+        setError(QString("mkdir(%1) failed: %2").arg(remotePath, sessionError()));
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 同会话内 server-side 拷贝 —— SFTP 协议本身没有 server-side copy 原语，
+// 所以只能 read 一边 write 另一边。带宽走的是 SSH 通道；好处是不必落地客户端
+// 缓冲（按块流式）。失败时尝试清理半成品。
+// ---------------------------------------------------------------------------
+bool SftpClient::copyFile(const QString& srcRemotePath,
+                          const QString& dstRemotePath) {
+    if (!m_sftp) { setError("SFTP channel not open"); return false; }
+
+    QByteArray srcUtf8 = srcRemotePath.toUtf8();
+    QByteArray dstUtf8 = dstRemotePath.toUtf8();
+
+    LIBSSH2_SFTP_HANDLE* in =
+        libssh2_sftp_open(m_sftp, srcUtf8.constData(),
+                          LIBSSH2_FXF_READ, 0);
+    if (!in) {
+        setError(QString("open(%1) for read failed: %2")
+                 .arg(srcRemotePath, sessionError()));
+        return false;
+    }
+
+    // 0644 默认权限；CREAT|WRITE|TRUNC = 覆盖式新建
+    long mode = LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR
+              | LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IROTH;
+    LIBSSH2_SFTP_HANDLE* out =
+        libssh2_sftp_open(m_sftp, dstUtf8.constData(),
+                          LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
+                          mode);
+    if (!out) {
+        libssh2_sftp_close(in);
+        setError(QString("open(%1) for write failed: %2")
+                 .arg(dstRemotePath, sessionError()));
+        return false;
+    }
+
+    constexpr int kBuf = 32 * 1024;  // 32KB —— SFTP 包通常 32K 上限友好
+    QByteArray buf(kBuf, Qt::Uninitialized);
+    bool ok = true;
+    while (true) {
+        ssize_t n = libssh2_sftp_read(in, buf.data(), buf.size());
+        if (n == 0) break;
+        if (n < 0) {
+            setError(QString("read(%1) failed: %2")
+                     .arg(srcRemotePath, sessionError()));
+            ok = false;
+            break;
+        }
+        const char* p = buf.constData();
+        ssize_t left = n;
+        while (left > 0) {
+            ssize_t w = libssh2_sftp_write(out, p, left);
+            if (w < 0) {
+                setError(QString("write(%1) failed: %2")
+                         .arg(dstRemotePath, sessionError()));
+                ok = false;
+                break;
+            }
+            left -= w;
+            p    += w;
+        }
+        if (!ok) break;
+    }
+
+    libssh2_sftp_close(in);
+    libssh2_sftp_close(out);
+
+    if (!ok) {
+        // 半成品收尾：能 unlink 就 unlink，失败也只能算了
+        libssh2_sftp_unlink(m_sftp, dstUtf8.constData());
+    }
+    return ok;
+}
+
+bool SftpClient::copyRecursive(const QString& srcRemotePath,
+                               const QString& dstRemotePath) {
+    if (!m_sftp) { setError("SFTP channel not open"); return false; }
+
+    LIBSSH2_SFTP_ATTRIBUTES a;
+    QByteArray sp = srcRemotePath.toUtf8();
+    if (libssh2_sftp_stat(m_sftp, sp.constData(), &a) != 0) {
+        setError(QString("stat(%1) failed: %2")
+                 .arg(srcRemotePath, sessionError()));
+        return false;
+    }
+    bool isDir = (a.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS)
+              && LIBSSH2_SFTP_S_ISDIR(a.permissions);
+    if (!isDir) {
+        return copyFile(srcRemotePath, dstRemotePath);
+    }
+
+    // 目录：自身不存在则创建（已存在则继续 merge）
+    if (!exists(dstRemotePath)) {
+        if (!makeDirectory(dstRemotePath)) return false;
+    }
+
+    bool savedHidden = m_showHidden;
+    m_showHidden = true;
+    auto kids = listDirectory(srcRemotePath);
+    m_showHidden = savedHidden;
+
+    for (const auto& e : kids) {
+        // 拼出目标路径：srcRemotePath/<name> → dstRemotePath/<name>
+        // listDirectory 的 e.path 已是绝对，取 name 即可
+        QString dst = dstRemotePath;
+        if (!dst.endsWith('/')) dst += '/';
+        dst += e.name;
+        if (!copyRecursive(e.path, dst)) return false;
+    }
+    return true;
+}
+
+// ===========================================================================
+// 本地↔远程传输（uploadFile / uploadRecursive / downloadFile / downloadRecursive）
+//
+// 设计要点：
+//   - 块大小 32 KB，与 copyFile 保持一致（对 SFTP 包尺寸友好）
+//   - byte-level 进度回调：bytesDone 是"会话累计"，递归调用之间共享同一个
+//     计数器（外部传入指针，递归内部直接累加，UI 那侧拿到的是平滑增长的曲线）
+//   - bytesTotal 由外部预扫得到（localTotalBytes / remoteTotalBytes）。
+//     UI 不必为单文件单独算 total，传 0 也能跑（进度退化为 busy 模式）
+//   - progress 返回 false → 立刻返回 false，半成品文件尽量 unlink/QFile::remove
+// ===========================================================================
+
+qint64 SftpClient::localTotalBytes(const QString& localPath) {
+    QFileInfo fi(localPath);
+    if (!fi.exists()) return 0;
+    if (fi.isFile()) return fi.size();
+    if (!fi.isDir())  return 0;
+
+    qint64 total = 0;
+    QDir dir(localPath);
+    const auto kids = dir.entryInfoList(
+        QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden);
+    for (const auto& k : kids) {
+        total += localTotalBytes(k.absoluteFilePath());
+    }
+    return total;
+}
+
+qint64 SftpClient::remoteTotalBytes(const QString& remotePath) {
+    if (!m_sftp) return 0;
+    LIBSSH2_SFTP_ATTRIBUTES a;
+    QByteArray rp = remotePath.toUtf8();
+    if (libssh2_sftp_stat(m_sftp, rp.constData(), &a) != 0) return 0;
+    bool isDir = (a.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS)
+              && LIBSSH2_SFTP_S_ISDIR(a.permissions);
+    if (!isDir) {
+        return (a.flags & LIBSSH2_SFTP_ATTR_SIZE) ? (qint64)a.filesize : 0;
+    }
+    bool savedHidden = m_showHidden;
+    m_showHidden = true;
+    auto kids = listDirectory(remotePath);
+    m_showHidden = savedHidden;
+
+    qint64 total = 0;
+    for (const auto& e : kids) {
+        if (e.isDirectory) total += remoteTotalBytes(e.path);
+        else               total += e.size;
+    }
+    return total;
+}
+
+bool SftpClient::uploadFile(const QString& localPath,
+                            const QString& remotePath,
+                            const TransferProgressFn& progress,
+                            qint64 bytesTotal,
+                            qint64* bytesDone) {
+    if (!m_sftp) { setError("SFTP channel not open"); return false; }
+
+    QFile in(localPath);
+    if (!in.open(QIODevice::ReadOnly)) {
+        setError(QString("open local %1 for read failed: %2")
+                 .arg(localPath, in.errorString()));
+        return false;
+    }
+
+    // 0644 默认权限；CREAT|WRITE|TRUNC = 覆盖式新建
+    QByteArray dstUtf8 = remotePath.toUtf8();
+    long mode = LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR
+              | LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IROTH;
+    LIBSSH2_SFTP_HANDLE* out =
+        libssh2_sftp_open(m_sftp, dstUtf8.constData(),
+                          LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
+                          mode);
+    if (!out) {
+        setError(QString("sftp open(%1) for write failed: %2")
+                 .arg(remotePath, sessionError()));
+        return false;
+    }
+
+    const QString name = QFileInfo(localPath).fileName();
+    constexpr int kBuf = 32 * 1024;
+    QByteArray buf(kBuf, Qt::Uninitialized);
+    bool ok = true;
+    qint64 localDone = 0;
+    while (true) {
+        qint64 n = in.read(buf.data(), buf.size());
+        if (n == 0) break;
+        if (n < 0) {
+            setError(QString("read local %1 failed: %2")
+                     .arg(localPath, in.errorString()));
+            ok = false;
+            break;
+        }
+        const char* p = buf.constData();
+        qint64 left = n;
+        while (left > 0) {
+            ssize_t w = libssh2_sftp_write(out, p, left);
+            if (w < 0) {
+                setError(QString("sftp write(%1) failed: %2")
+                         .arg(remotePath, sessionError()));
+                ok = false;
+                break;
+            }
+            left -= w;
+            p    += w;
+        }
+        if (!ok) break;
+
+        localDone += n;
+        if (bytesDone) *bytesDone += n;
+        if (progress) {
+            qint64 cur = bytesDone ? *bytesDone : localDone;
+            if (!progress(name, cur, bytesTotal)) {
+                setError("upload canceled by user");
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    libssh2_sftp_close(out);
+    in.close();
+
+    if (!ok) {
+        // 半成品收尾
+        libssh2_sftp_unlink(m_sftp, dstUtf8.constData());
+    }
+    return ok;
+}
+
+bool SftpClient::uploadRecursive(const QString& localPath,
+                                 const QString& remotePath,
+                                 const TransferProgressFn& progress,
+                                 qint64 bytesTotal,
+                                 qint64* bytesDone) {
+    if (!m_sftp) { setError("SFTP channel not open"); return false; }
+
+    QFileInfo fi(localPath);
+    if (!fi.exists()) {
+        setError(QString("local %1 does not exist").arg(localPath));
+        return false;
+    }
+    if (fi.isFile()) {
+        return uploadFile(localPath, remotePath, progress, bytesTotal, bytesDone);
+    }
+    if (!fi.isDir()) {
+        setError(QString("local %1 is neither file nor dir").arg(localPath));
+        return false;
+    }
+
+    // 目录：远端不存在则创建（已存在则 merge）
+    if (!exists(remotePath)) {
+        if (!makeDirectory(remotePath)) return false;
+    }
+
+    QDir dir(localPath);
+    const auto kids = dir.entryInfoList(
+        QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden);
+    for (const auto& k : kids) {
+        QString dst = remotePath;
+        if (!dst.endsWith('/')) dst += '/';
+        dst += k.fileName();
+        if (!uploadRecursive(k.absoluteFilePath(), dst,
+                             progress, bytesTotal, bytesDone)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool SftpClient::downloadFile(const QString& remotePath,
+                              const QString& localPath,
+                              const TransferProgressFn& progress,
+                              qint64 bytesTotal,
+                              qint64* bytesDone) {
+    if (!m_sftp) { setError("SFTP channel not open"); return false; }
+
+    QByteArray srcUtf8 = remotePath.toUtf8();
+    LIBSSH2_SFTP_HANDLE* in =
+        libssh2_sftp_open(m_sftp, srcUtf8.constData(),
+                          LIBSSH2_FXF_READ, 0);
+    if (!in) {
+        setError(QString("sftp open(%1) for read failed: %2")
+                 .arg(remotePath, sessionError()));
+        return false;
+    }
+
+    QFile out(localPath);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        libssh2_sftp_close(in);
+        setError(QString("open local %1 for write failed: %2")
+                 .arg(localPath, out.errorString()));
+        return false;
+    }
+
+    const QString name = QFileInfo(remotePath).fileName();
+    constexpr int kBuf = 32 * 1024;
+    QByteArray buf(kBuf, Qt::Uninitialized);
+    bool ok = true;
+    qint64 localDone = 0;
+    while (true) {
+        ssize_t n = libssh2_sftp_read(in, buf.data(), buf.size());
+        if (n == 0) break;
+        if (n < 0) {
+            setError(QString("sftp read(%1) failed: %2")
+                     .arg(remotePath, sessionError()));
+            ok = false;
+            break;
+        }
+        qint64 written = out.write(buf.constData(), n);
+        if (written != n) {
+            setError(QString("write local %1 failed: %2")
+                     .arg(localPath, out.errorString()));
+            ok = false;
+            break;
+        }
+        localDone += n;
+        if (bytesDone) *bytesDone += n;
+        if (progress) {
+            qint64 cur = bytesDone ? *bytesDone : localDone;
+            if (!progress(name, cur, bytesTotal)) {
+                setError("download canceled by user");
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    libssh2_sftp_close(in);
+    out.close();
+
+    if (!ok) {
+        out.remove();   // 删半成品
+    }
+    return ok;
+}
+
+bool SftpClient::downloadRecursive(const QString& remotePath,
+                                   const QString& localPath,
+                                   const TransferProgressFn& progress,
+                                   qint64 bytesTotal,
+                                   qint64* bytesDone) {
+    if (!m_sftp) { setError("SFTP channel not open"); return false; }
+
+    LIBSSH2_SFTP_ATTRIBUTES a;
+    QByteArray rp = remotePath.toUtf8();
+    if (libssh2_sftp_stat(m_sftp, rp.constData(), &a) != 0) {
+        setError(QString("sftp stat(%1) failed: %2")
+                 .arg(remotePath, sessionError()));
+        return false;
+    }
+    bool isDir = (a.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS)
+              && LIBSSH2_SFTP_S_ISDIR(a.permissions);
+    if (!isDir) {
+        return downloadFile(remotePath, localPath, progress, bytesTotal, bytesDone);
+    }
+
+    // 目录：本地不存在则创建（已存在则 merge）
+    QDir dir;
+    if (!dir.exists(localPath)) {
+        if (!dir.mkpath(localPath)) {
+            setError(QString("mkpath local %1 failed").arg(localPath));
+            return false;
+        }
+    }
+
+    bool savedHidden = m_showHidden;
+    m_showHidden = true;
+    auto kids = listDirectory(remotePath);
+    m_showHidden = savedHidden;
+
+    for (const auto& e : kids) {
+        QString dstLocal = localPath;
+        if (!dstLocal.endsWith('/')) dstLocal += '/';
+        dstLocal += e.name;
+        if (!downloadRecursive(e.path, dstLocal,
+                               progress, bytesTotal, bytesDone)) {
+            return false;
+        }
+    }
+    return true;
 }

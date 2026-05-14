@@ -12,6 +12,8 @@
 #include "RealFileSystem.h"
 #include "SftpClient.h"
 #include "SmbClient.h"
+#include <QFile>
+#include <QFileInfo>
 
 FileSystemRouter& FileSystemRouter::instance() {
     static FileSystemRouter inst;
@@ -195,4 +197,126 @@ void FileSystemRouter::setShowHidden(bool show) {
         it->second->setShowHidden(show);
     }
     // SmbClient 暂未提供 setShowHidden（隐藏文件在 SMB 里少见）；预留扩展。
+}
+
+// ---------------------------------------------------------------------------
+// 文件操作派发
+// ---------------------------------------------------------------------------
+bool FileSystemRouter::sameMount(const QString& a, const QString& b) const {
+    return resolve(a).mount == resolve(b).mount;
+}
+
+bool FileSystemRouter::removePath(const QString& path) {
+    Resolved r = resolve(path);
+    if (r.sftp) {
+        bool ok = r.sftp->removeRecursive(r.remotePath);
+        if (!ok) m_lastError = r.sftp->lastError();
+        return ok;
+    }
+    if (r.smb) {
+        m_lastError = QStringLiteral("SMB delete is not implemented yet");
+        return false;
+    }
+    // 本地：用 RealFileSystem 的递归删
+    int dummy = 0;
+    bool ok = RealFileSystem::instance().deleteDirectoryWithProgress(path, nullptr, dummy);
+    if (!ok) m_lastError = QStringLiteral("local delete failed: ") + path;
+    return ok;
+}
+
+bool FileSystemRouter::renamePath(const QString& oldPath, const QString& newPath) {
+    if (!sameMount(oldPath, newPath)) {
+        m_lastError = QStringLiteral("rename across different mounts is not supported");
+        return false;
+    }
+    Resolved ro = resolve(oldPath);
+    Resolved rn = resolve(newPath);
+    if (ro.sftp) {
+        bool ok = ro.sftp->renamePath(ro.remotePath, rn.remotePath);
+        if (!ok) m_lastError = ro.sftp->lastError();
+        return ok;
+    }
+    if (ro.smb) {
+        m_lastError = QStringLiteral("SMB rename is not implemented yet");
+        return false;
+    }
+    // 本地：先尝试 QFile::rename（同设备 O(1)）；失败留给上层做 copy+delete 的回退
+    if (QFile::rename(oldPath, newPath)) return true;
+    m_lastError = QStringLiteral("local rename failed: ") + oldPath;
+    return false;
+}
+
+bool FileSystemRouter::copyPath(const QString& srcPath, const QString& dstPath) {
+    if (!sameMount(srcPath, dstPath)) {
+        m_lastError = QStringLiteral("copy across different mounts is not supported");
+        return false;
+    }
+    Resolved rs = resolve(srcPath);
+    Resolved rd = resolve(dstPath);
+    if (rs.sftp) {
+        bool ok = rs.sftp->copyRecursive(rs.remotePath, rd.remotePath);
+        if (!ok) m_lastError = rs.sftp->lastError();
+        return ok;
+    }
+    if (rs.smb) {
+        m_lastError = QStringLiteral("SMB copy is not implemented yet");
+        return false;
+    }
+    // 本地：用 RealFileSystem（不带进度回调）
+    int dummy = 0;
+    QString destDir = QFileInfo(dstPath).absolutePath();
+    bool ok = RealFileSystem::instance().copyFileWithProgress(srcPath, destDir, nullptr, dummy);
+    if (!ok) m_lastError = QStringLiteral("local copy failed: ") + srcPath;
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// 跨边界传输（local ↔ sftp）。SMB 暂不支持。
+// ---------------------------------------------------------------------------
+bool FileSystemRouter::transferAcross(const QString& srcPath,
+                                      const QString& dstPath,
+                                      const SftpClient::TransferProgressFn& progress,
+                                      qint64 bytesTotal,
+                                      qint64* bytesDone) {
+    Resolved rs = resolve(srcPath);
+    Resolved rd = resolve(dstPath);
+
+    // SMB 任一侧：暂不支持
+    if (rs.smb || rd.smb) {
+        m_lastError = QStringLiteral("SMB transfer is not implemented yet");
+        return false;
+    }
+
+    const bool srcRemote = (rs.sftp != nullptr);
+    const bool dstRemote = (rd.sftp != nullptr);
+
+    if (srcRemote && dstRemote) {
+        m_lastError = QStringLiteral("transferAcross: both sides remote — use copyPath instead");
+        return false;
+    }
+    if (!srcRemote && !dstRemote) {
+        m_lastError = QStringLiteral("transferAcross: both sides local — use RealFileSystem instead");
+        return false;
+    }
+
+    if (!srcRemote && dstRemote) {
+        // 上传：local → sftp
+        bool ok = rd.sftp->uploadRecursive(srcPath, rd.remotePath,
+                                           progress, bytesTotal, bytesDone);
+        if (!ok) m_lastError = rd.sftp->lastError();
+        return ok;
+    } else {
+        // 下载：sftp → local
+        bool ok = rs.sftp->downloadRecursive(rs.remotePath, dstPath,
+                                             progress, bytesTotal, bytesDone);
+        if (!ok) m_lastError = rs.sftp->lastError();
+        return ok;
+    }
+}
+
+qint64 FileSystemRouter::totalBytes(const QString& path) {
+    Resolved r = resolve(path);
+    if (r.sftp) return r.sftp->remoteTotalBytes(r.remotePath);
+    if (r.smb)  return 0;     // SMB 暂未实现
+    return SftpClient::localTotalBytes(path);
 }

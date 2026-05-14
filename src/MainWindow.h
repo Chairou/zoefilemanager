@@ -122,6 +122,10 @@ private:
     void updateStatusBar();   // 重算左右面板条目数 / 剪贴板提示
     FilePanel* activePanel() const;   // m_activePane 翻译为对应指针
 
+    /// 刷新左右两个面板的当前目录（应对剪切/粘贴/删除/拖拽等
+    /// 同时影响源和目标目录的操作）。代价低（仅 list 两次目录）。
+    void refreshAllPanels();
+
     // ----- 持久化（QSettings: WorkBuddy / ZoeFileManager） -----
     void loadSettings();      // 启动时读取并恢复左右面板路径、活跃面板、几何
     void saveSettings();      // 关闭时写入当前左右面板路径、活跃面板、几何

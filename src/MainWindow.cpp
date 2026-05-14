@@ -44,6 +44,7 @@
 #include <QStyle>
 #include <QPainterPath>
 #include <cmath>
+#include <limits>
 #include "I18n.h"
 #include "AppFonts.h"
 #include "SettingsDialog.h"
@@ -985,6 +986,14 @@ void MainWindow::onRefresh() {
     activePanel()->refresh();
 }
 
+// 复制/剪切/粘贴/删除等操作可能同时改变"源目录"和"目标目录"——
+// 双面板典型用法是左侧源、右侧目标（或相反），所以两侧都刷一次。
+// list 一次目录的代价远小于"用户看到陈旧文件状态"的体验损失。
+void MainWindow::refreshAllPanels() {
+    if (m_leftPanel)  m_leftPanel->refresh();
+    if (m_rightPanel) m_rightPanel->refresh();
+}
+
 // 复制：把当前选中条目记入应用内剪贴板。注意这不是系统剪贴板。
 // 系统剪贴板（onCopyPath）用来复制路径文本到外部使用。
 void MainWindow::onCopy() {
@@ -1015,33 +1024,140 @@ void MainWindow::onCut() {
 // 粘贴：从应用内剪贴板把条目复制 / 移动到 active panel 当前目录。
 //
 // 关键决策：
-//   - 跨本地↔远程：当前不支持，明确弹窗，避免 QFile::copy 在 sftp:// 路径上静默失败
-//   - 进度推进按"叶子文件计数"而不是按顶层条目数 → 大目录进度条平滑
-//   - 移动：先尝试 QFile::rename（同设备 O(1)），跨设备失败时回退到 copy+delete
+//   - 同 mount 远程内：走 SftpClient::renamePath / copyRecursive（server-side，无中转）
+//   - 跨本地↔远程 / 跨不同 mount：当前不支持，明确弹窗
+//   - 进度推进按"叶子文件计数"而不是按顶层条目数 → 大目录进度条平滑（仅本地）；
+//     远程按条目粒度推进
+//   - 移动：同 mount 内 SFTP 的 rename 是 server-side O(1)；本地先尝试
+//     QFile::rename（同设备 O(1)），跨设备失败时回退到 copy+delete
 //   - 用户取消：处理函数返回 false，打断循环但已完成的项保留（不回滚）
 void MainWindow::onPaste() {
     if (!m_clipboard.has_value()) return;
 
     auto& fs = RealFileSystem::instance();
+    auto& router = FileSystemRouter::instance();
     QString destPath = activePanel()->currentPath();
+    const QString srcPath = m_clipboard->sourcePath;
 
-    // Local<->remote transfers are not implemented yet - bail out loudly
-    // instead of silently failing a QFile::copy on an "sftp://..." path.
-    if (FileSystemRouter::instance().isRemote(destPath) ||
-        FileSystemRouter::instance().isRemote(m_clipboard->sourcePath)) {
+    const bool destRemote = router.isRemote(destPath);
+    const bool srcRemote  = router.isRemote(srcPath);
+
+    // 跨不同远程 mount（含 SMB↔SFTP）：暂不支持
+    if (destRemote && srcRemote && !router.sameMount(destPath, srcPath)) {
         QMessageBox::information(this, "Not supported yet",
-            "Paste across local/remote is not supported in this build.");
+            "Paste across different remote mounts is not supported in this build.");
         return;
     }
+
+    // 是否跨"本地↔SFTP"边界（SMB 此路径暂不支持，下方分支会回退到错误信息）
+    const bool isCrossBoundary = (destRemote != srcRemote);
+    const bool isRemote = (!isCrossBoundary) && destRemote;  // 同侧远程
     const bool isCut = m_clipboard->isCut;
     const QString verbIng = isCut ? "Moving" : "Copying";
     const QString verbDone = isCut ? "Moved" : "Copied";
 
+    // ------------------------------------------------------------------
+    // 跨边界（local ↔ sftp）：byte-level 进度，调 router.transferAcross
+    // ------------------------------------------------------------------
+    if (isCrossBoundary) {
+        // 预扫总字节数（驱动进度条上限）
+        qint64 totalBytes = 0;
+        for (const auto& entry : m_clipboard->entries) {
+            totalBytes += router.totalBytes(entry.path);
+        }
+        if (totalBytes <= 0) totalBytes = 1;   // guard
+
+        // QProgressDialog 用 int 范围；超过 INT_MAX 时把字节折算成 KB
+        const bool useKB = totalBytes > std::numeric_limits<int>::max();
+        const qint64 scale = useKB ? 1024 : 1;
+        const int maxVal = static_cast<int>(totalBytes / scale);
+        const QString unit = useKB ? "KB" : "B";
+
+        QProgressDialog progress(
+            QString("%1 to %2...").arg(verbIng, destPath),
+            "Cancel", 0, maxVal, this);
+        progress.setWindowTitle(isCut ? "Move" : "Copy");
+        progress.setWindowModality(Qt::WindowModal);
+        progress.setMinimumDuration(200);
+        progress.setAutoClose(true);
+        progress.setAutoReset(true);
+
+        qint64 bytesDone = 0;
+        bool canceled = false;
+        int  failedEntries = 0;
+
+        auto progressFn = [&](const QString& curName,
+                              qint64 done, qint64 total) -> bool {
+            (void)total;
+            progress.setValue(static_cast<int>(done / scale));
+            progress.setLabelText(
+                QString("%1: %2  (%3 / %4 %5)")
+                    .arg(verbIng, curName)
+                    .arg(done / scale).arg(maxVal).arg(unit));
+            QApplication::processEvents();
+            return !progress.wasCanceled();
+        };
+
+        for (const auto& entry : m_clipboard->entries) {
+            if (progress.wasCanceled()) { canceled = true; break; }
+
+            // 目标路径 = destPath + "/" + 源条目名
+            QString destFull = destPath;
+            if (!destFull.endsWith('/')) destFull += '/';
+            destFull += entry.name;
+
+            qint64 before = bytesDone;
+            bool ok = router.transferAcross(entry.path, destFull,
+                                            progressFn, totalBytes, &bytesDone);
+            if (!ok) {
+                if (progress.wasCanceled()) { canceled = true; break; }
+                failedEntries++;
+                // 跳过该条目：把"应有的字节量"补齐，避免后续进度回退
+                qint64 expected = router.totalBytes(entry.path);
+                if (bytesDone < before + expected) {
+                    bytesDone = before + expected;
+                    progress.setValue(static_cast<int>(bytesDone / scale));
+                }
+                continue;
+            }
+
+            // Cut 跨边界：传输成功后删源（与本地跨设备 move 范式一致）
+            if (isCut) {
+                if (!router.removePath(entry.path)) {
+                    // 源删除失败不算整个传输失败，但提示用户
+                    statusBar()->showMessage(
+                        QString("Source remove failed: %1").arg(entry.path), 5000);
+                }
+            }
+        }
+        progress.setValue(maxVal);
+
+        if (canceled) {
+            statusBar()->showMessage(QString("%1 canceled").arg(verbDone), 3000);
+        } else if (failedEntries == 0) {
+            statusBar()->showMessage(
+                QString("%1 %2 item(s) to %3")
+                    .arg(verbDone).arg(m_clipboard->entries.size()).arg(destPath),
+                3000);
+        } else {
+            statusBar()->showMessage(
+                QString("%1 with %2 failed item(s)").arg(verbDone).arg(failedEntries),
+                3000);
+        }
+        if (isCut) m_clipboard.reset();
+        // 跨边界传输同时影响源和目标目录（cut 还会删源），刷新左右两侧
+        refreshAllPanels();
+        updateStatusBar();
+        return;
+    }
+
     // Pre-scan: total file count across all selected top-level entries.
     // This way progress scales with actual work, not with selection count.
+    // 远程：每条目按 1 计（fs.countEntries 只懂本地路径）
     int totalFiles = 0;
     for (const auto& entry : m_clipboard->entries) {
-        totalFiles += fs.countEntries(entry.path);
+        if (isRemote) totalFiles += 1;
+        else          totalFiles += fs.countEntries(entry.path);
     }
     if (totalFiles <= 0) totalFiles = 1;  // guard div/zero
 
@@ -1067,6 +1183,26 @@ void MainWindow::onPaste() {
 
     for (const auto& entry : m_clipboard->entries) {
         if (progress.wasCanceled()) { canceled = true; break; }
+
+        if (isRemote) {
+            // 同 mount 远程：rename 是 server-side O(1)；copy 是 SSH 通道里
+            // 流式读+写。粒度只到"条目"（再细需要给 SftpClient 加回调，下一轮）。
+            QString destFull = destPath + "/" + entry.name;
+            progress.setLabelText(QString("%1: %2").arg(verbIng, entry.name));
+            QApplication::processEvents();
+
+            bool ok;
+            if (isCut) ok = router.renamePath(entry.path, destFull);
+            else       ok = router.copyPath(entry.path, destFull);
+
+            if (!ok) {
+                failedEntries++;
+                // 注意：远程没有"进度回调里发现取消"这条路径，所以无需检查 wasCanceled
+            }
+            processed += 1;
+            progress.setValue(processed);
+            continue;
+        }
 
         if (isCut) {
             // Move: try QFile::rename first (fast, same filesystem). Fallback: copy+delete.
@@ -1119,7 +1255,8 @@ void MainWindow::onPaste() {
     if (isCut) {
         m_clipboard.reset();
     }
-    activePanel()->refresh();
+    // 复制/剪切都可能同时影响源和目标目录，刷新左右两侧
+    refreshAllPanels();
     updateStatusBar();
 }
 
@@ -1132,22 +1269,122 @@ void MainWindow::onDropCopy(const QStringList& sourcePaths,
                             PanelSide destSide) {
     if (sourcePaths.isEmpty()) return;
 
-    // Drag&drop across local <-> remote is not supported in this build,
-    // mirroring onPaste's policy. Fail loud, not silent.
-    if (FileSystemRouter::instance().isRemote(destPath)) {
-        QMessageBox::information(this, "Not supported yet",
-            "Dropping into a remote (SFTP) folder is not supported in this build.");
-        return;
-    }
+    auto& fs = RealFileSystem::instance();
+    auto& router = FileSystemRouter::instance();
+
+    const bool destRemote = router.isRemote(destPath);
+
+    // 校验所有源是否在同一侧（本地或同一 mount）。允许跨"本地↔SFTP"边界。
+    bool anySrcRemote = false, allSrcRemote = true;
+    QString srcMount;
     for (const QString& p : sourcePaths) {
-        if (FileSystemRouter::instance().isRemote(p)) {
-            QMessageBox::information(this, "Not supported yet",
-                "Dropping remote files into a local folder is not supported in this build.");
-            return;
+        bool r = router.isRemote(p);
+        anySrcRemote = anySrcRemote || r;
+        allSrcRemote = allSrcRemote && r;
+        if (r) {
+            QString m = router.mountFor(p);
+            if (srcMount.isEmpty()) srcMount = m;
+            else if (srcMount != m) {
+                QMessageBox::information(this, "Not supported yet",
+                    "Drop across different remote mounts is not supported.");
+                return;
+            }
         }
     }
+    if (anySrcRemote && !allSrcRemote) {
+        // 同一次拖拽里混了远程+本地源，不处理
+        QMessageBox::information(this, "Not supported yet",
+            "Mixing local and remote sources in one drop is not supported.");
+        return;
+    }
+    const bool srcRemote = anySrcRemote;
 
-    auto& fs = RealFileSystem::instance();
+    // 跨不同远程 mount（已在上面挡住）；跨"本地↔SFTP"走 transferAcross
+    const bool isCrossBoundary = (destRemote != srcRemote);
+
+    // ------------------------------------------------------------------
+    // 跨边界（local ↔ sftp）：byte-level 进度 + transferAcross
+    // ------------------------------------------------------------------
+    if (isCrossBoundary) {
+        qint64 totalBytes = 0;
+        for (const QString& p : sourcePaths) totalBytes += router.totalBytes(p);
+        if (totalBytes <= 0) totalBytes = 1;
+
+        const bool useKB = totalBytes > std::numeric_limits<int>::max();
+        const qint64 scale = useKB ? 1024 : 1;
+        const int maxVal = static_cast<int>(totalBytes / scale);
+        const QString unit = useKB ? "KB" : "B";
+
+        QProgressDialog progress(QString("Copying to %1...").arg(destPath),
+                                 "Cancel", 0, maxVal, this);
+        progress.setWindowTitle("Drop Copy");
+        progress.setWindowModality(Qt::WindowModal);
+        progress.setMinimumDuration(200);
+        progress.setAutoClose(true);
+        progress.setAutoReset(true);
+
+        qint64 bytesDone = 0;
+        int failed = 0;
+        bool canceled = false;
+
+        auto progressFn = [&](const QString& curName,
+                              qint64 done, qint64 total) -> bool {
+            (void)total;
+            progress.setValue(static_cast<int>(done / scale));
+            progress.setLabelText(
+                QString("Copying: %1  (%2 / %3 %4)")
+                    .arg(curName).arg(done / scale).arg(maxVal).arg(unit));
+            QApplication::processEvents();
+            return !progress.wasCanceled();
+        };
+
+        for (const QString& src : sourcePaths) {
+            if (progress.wasCanceled()) { canceled = true; break; }
+            QString destFull = destPath;
+            if (!destFull.endsWith('/')) destFull += '/';
+            destFull += QFileInfo(src).fileName();
+
+            qint64 before = bytesDone;
+            bool ok = router.transferAcross(src, destFull,
+                                            progressFn, totalBytes, &bytesDone);
+            if (!ok) {
+                if (progress.wasCanceled()) { canceled = true; break; }
+                failed++;
+                qint64 expected = router.totalBytes(src);
+                if (bytesDone < before + expected) {
+                    bytesDone = before + expected;
+                    progress.setValue(static_cast<int>(bytesDone / scale));
+                }
+            }
+        }
+        progress.setValue(maxVal);
+
+        if (canceled) {
+            statusBar()->showMessage("Drop copy canceled", 3000);
+        } else if (failed == 0) {
+            statusBar()->showMessage(
+                QString("Copied %1 item(s) to %2").arg(sourcePaths.size()).arg(destPath),
+                3000);
+        } else {
+            statusBar()->showMessage(
+                QString("Copied with %1 failed item(s)").arg(failed), 3000);
+        }
+        FilePanel* destPanel = (destSide == PanelSide::Left) ? m_leftPanel : m_rightPanel;
+        destPanel->refresh();
+        // 跨边界拖拽：源面板（另一侧）也需要刷新以反映最新远端/本地状态
+        FilePanel* otherPanel = (destSide == PanelSide::Left) ? m_rightPanel : m_leftPanel;
+        if (otherPanel) otherPanel->refresh();
+        updateStatusBar();
+        return;
+    }
+
+    // 远程→远程拖拽（同 mount）：暂仍未实现，保持原拒绝逻辑（远程同 mount 复制
+    // 走 onPaste 即可，拖拽语义未来再扩）
+    if (destRemote || srcRemote) {
+        QMessageBox::information(this, "Not supported yet",
+            "Dropping inside remote folders is not supported in this build.");
+        return;
+    }
 
     // Pre-scan total work units so progress scales with leaf-file count.
     int totalFiles = 0;
@@ -1199,26 +1436,26 @@ void MainWindow::onDropCopy(const QStringList& sourcePaths,
     }
 
     // Refresh the *destination* panel (where the drop landed) so the new
-    // entries become visible immediately.
+    // entries become visible immediately. 同时刷源侧面板——跨面板拖拽
+    // 源目录的视图也可能受影响（虽然纯本地复制不删源，但保险起见对齐
+    // onPaste 行为，让用户始终看到最新状态）。
     FilePanel* destPanel = (destSide == PanelSide::Left) ? m_leftPanel : m_rightPanel;
     destPanel->refresh();
+    FilePanel* otherPanel = (destSide == PanelSide::Left) ? m_rightPanel : m_leftPanel;
+    if (otherPanel) otherPanel->refresh();
     updateStatusBar();
 }
 
-// 删除：弹确认 + 进度对话框 + 失败计数。远程不支持。
-// 注意 deleteDirectoryWithProgress 走自底向上递归，rmdir 要求空目录。
+// 删除：弹确认 + 进度对话框 + 失败计数。
+// - 本地：用 RealFileSystem::deleteDirectoryWithProgress（带逐文件进度回调）
+// - 远程：用 FileSystemRouter::removePath（一次到底，不带细粒度进度——
+//   整个条目作为一个进度单位推进，因为 SFTP 一次 listDir 列全部子项再 unlink，
+//   实现细粒度回调要把回调灌进 SftpClient 内部，下一轮再做）
 void MainWindow::onDelete() {
     auto selected = activePanel()->getSelectedEntries();
     if (selected.isEmpty()) return;
 
-    // Guard: remote delete is not implemented in this build.
-    for (const auto& e : selected) {
-        if (FileSystemRouter::instance().isRemote(e.path)) {
-            QMessageBox::information(this, "Not supported yet",
-                "Deleting remote files is not supported in this build.");
-            return;
-        }
-    }
+    auto& router = FileSystemRouter::instance();
 
     auto reply = QMessageBox::question(this, "Delete",
         QString("Delete %1 item(s)? This cannot be undone.").arg(selected.size()),
@@ -1228,10 +1465,13 @@ void MainWindow::onDelete() {
 
     auto& fs = RealFileSystem::instance();
 
-    // Pre-scan: count every leaf file so progress scales with real work
+    // Pre-scan: count every leaf file so progress scales with real work.
+    // 远程条目用 1 计数（router 没有便宜的 countEntries；一次 listDir 都是网络 RTT，
+    // 不值得为进度条多打几个 RTT）。这样远程进度按"条目"推进，本地按"叶子文件"推进。
     int totalFiles = 0;
     for (const auto& entry : selected) {
-        totalFiles += fs.countEntries(entry.path);
+        if (router.isRemote(entry.path)) totalFiles += 1;
+        else                              totalFiles += fs.countEntries(entry.path);
     }
     if (totalFiles <= 0) totalFiles = 1;
 
@@ -1258,7 +1498,17 @@ void MainWindow::onDelete() {
     for (const auto& entry : selected) {
         if (progress.wasCanceled()) { canceled = true; break; }
 
-        bool ok = fs.deleteDirectoryWithProgress(entry.path, progressFn, processed);
+        bool ok;
+        if (router.isRemote(entry.path)) {
+            // 远程：整体一次完成；进度只能按条目粒度推进
+            progress.setLabelText(QString("Deleting: %1").arg(entry.name));
+            QApplication::processEvents();
+            ok = router.removePath(entry.path);
+            processed += 1;
+            progress.setValue(processed);
+        } else {
+            ok = fs.deleteDirectoryWithProgress(entry.path, progressFn, processed);
+        }
         if (!ok) {
             if (progress.wasCanceled()) { canceled = true; break; }
             failedEntries++;
@@ -2307,28 +2557,43 @@ void MainWindow::onCreateNewFolder(const QString& dir, bool isRemote) {
 }
 
 // 重命名：把 oldPath 改成用户输入的名字（同目录内）。
-// - 远程（sftp:// 等）路径暂不支持
+// - 远程（sftp://）：通过 FileSystemRouter::renamePath 派发到 SftpClient::renamePath
+//   （同 mount 内，跨 mount 不支持）；SMB 暂未实现，会返回错误
 // - 非法字符检查复用 hasInvalidNameChars
 // - 与已存在名冲突：提示覆盖 / 取消（只对文件提示覆盖；目录冲突直接拒绝避免误合并）
 void MainWindow::onRenameEntry(const QString& oldPath) {
     if (oldPath.isEmpty()) return;
 
-    if (FileSystemRouter::instance().isRemote(oldPath)) {
-        QMessageBox::information(this, T("Not Supported"),
-            T("Renaming on remote paths is not supported yet."));
-        return;
-    }
+    auto& router = FileSystemRouter::instance();
+    const bool isRemote = router.isRemote(oldPath);
 
-    QFileInfo fi(oldPath);
-    if (!fi.exists()) {
+    // 远程：用 router 自己的 exists/isDirectory 而不是 QFileInfo
+    bool itemExists = isRemote ? router.exists(oldPath) : QFileInfo::exists(oldPath);
+    if (!itemExists) {
         QMessageBox::warning(this, T("Rename Failed"), T("The item no longer exists."));
         activePanel()->refresh();
         return;
     }
 
-    const QString oldName = fi.fileName();
-    const QString dir = fi.absolutePath();
-    const bool isDir = fi.isDir();
+    // 取 oldName / 父目录：本地用 QFileInfo；远程用最后一个 '/'（QFileInfo 对
+    // sftp://... 这种 URL 行为不可靠，但 absolutePath 仍能识别 '/'）
+    QString oldName, dir;
+    bool isDir;
+    if (isRemote) {
+        const int slash = oldPath.lastIndexOf('/');
+        if (slash <= 0) {
+            QMessageBox::warning(this, T("Rename Failed"), T("Cannot rename mount root."));
+            return;
+        }
+        oldName = oldPath.mid(slash + 1);
+        dir     = oldPath.left(slash);
+        isDir   = router.isDirectory(oldPath);
+    } else {
+        QFileInfo fi(oldPath);
+        oldName = fi.fileName();
+        dir     = fi.absolutePath();
+        isDir   = fi.isDir();
+    }
 
     bool ok = false;
     QString newName = QInputDialog::getText(this,
@@ -2344,12 +2609,15 @@ void MainWindow::onRenameEntry(const QString& oldPath) {
         return;
     }
 
-    const QString newPath = QDir(dir).filePath(newName);
+    const QString newPath = dir + "/" + newName;
     const bool zh = (I18n::instance().current() == I18n::Lang::Zh);
 
-    // 冲突处理
-    if (QFileInfo::exists(newPath)) {
-        if (isDir || QFileInfo(newPath).isDir()) {
+    // 冲突处理（远程也走 router.exists / router.isDirectory）
+    bool destExists = isRemote ? router.exists(newPath) : QFileInfo::exists(newPath);
+    if (destExists) {
+        bool destIsDir = isRemote ? router.isDirectory(newPath)
+                                  : QFileInfo(newPath).isDir();
+        if (isDir || destIsDir) {
             QMessageBox::warning(this, T("Rename Failed"),
                 QString(zh ? "名为 \"%1\" 的文件或文件夹已存在。"
                            : "A folder or file named \"%1\" already exists.").arg(newName));
@@ -2360,7 +2628,10 @@ void MainWindow::onRenameEntry(const QString& oldPath) {
                        : "A file named \"%1\" already exists.\nOverwrite it?").arg(newName),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
         if (ret != QMessageBox::Yes) return;
-        if (!QFile::remove(newPath)) {
+        // 远程多数 SFTP 服务器的 rename 不会自动覆盖，先 unlink
+        bool removed = isRemote ? router.removePath(newPath)
+                                : QFile::remove(newPath);
+        if (!removed) {
             QMessageBox::warning(this, T("Rename Failed"),
                 zh ? "无法删除已存在的文件以覆盖。"
                    : "Cannot remove the existing file to overwrite.");
@@ -2368,11 +2639,16 @@ void MainWindow::onRenameEntry(const QString& oldPath) {
         }
     }
 
-    // 执行 rename：QFile::rename 对文件/目录都适用（调用 POSIX rename）
-    if (!QFile::rename(oldPath, newPath)) {
+    // 执行 rename：本地走 QFile::rename，远程走 router.renamePath
+    bool renamed = isRemote ? router.renamePath(oldPath, newPath)
+                            : QFile::rename(oldPath, newPath);
+    if (!renamed) {
+        QString detail = isRemote ? router.lastError() : QString();
         QMessageBox::warning(this, T("Rename Failed"),
-            QString(zh ? "无法将 \"%1\" 重命名为 \"%2\"。"
-                       : "Cannot rename \"%1\" to \"%2\".").arg(oldName, newName));
+            QString(zh ? "无法将 \"%1\" 重命名为 \"%2\"。%3"
+                       : "Cannot rename \"%1\" to \"%2\". %3")
+                .arg(oldName, newName,
+                     detail.isEmpty() ? "" : "\n" + detail));
         return;
     }
 
