@@ -339,8 +339,29 @@ void PathBar::rebuildDisplay() {
             "QToolButton#crumbBtn:pressed {"
             "  color: #5E81AC;"
             "}");
-        connect(btn, &QToolButton::clicked, this, [this, absPath]() {
-            // SSOT：不自改 m_path，请求 FilePanel::navigateTo
+        connect(btn, &QToolButton::clicked, this, [this, btn, absPath]() {
+            // 1) 复制路径到剪贴板（保留原始 percent-encoded 字面，
+            //    粘贴回路径栏可直接被 router 路由）
+            QApplication::clipboard()->setText(absPath);
+
+            // 2) 在按钮下方弹出 toast，提示具体复制了什么路径
+            //    远程 URL 用 humanizeRemoteUrl 反解 percent-encoded 中文做提示，
+            //    本地路径直接显示。
+            QString shown = absPath;
+            if (absPath.contains("://")) {
+                shown = humanizeRemoteUrl(absPath);
+            }
+            // 太长截断，避免 toast 撑得过宽
+            if (shown.size() > 80) {
+                shown = shown.left(38) + QString::fromUtf8("…")
+                            + shown.right(38);
+            }
+            const QString msg = QString::fromUtf8("✓ ") + T("Copied: ") + shown;
+            const QPoint anchor = btn->mapToGlobal(
+                QPoint(btn->width() / 2, btn->height()));
+            showCopiedToast(anchor, msg);
+
+            // 3) SSOT：不自改 m_path，请求 FilePanel::navigateTo
             emit pathSelected(absPath);
         });
         return btn;
@@ -436,7 +457,7 @@ void PathBar::rebuildDisplay() {
     updateGeometry();
 }
 
-void PathBar::showCopiedToast(const QPoint& globalPos) {
+void PathBar::showCopiedToast(const QPoint& globalPos, const QString& message) {
     // Lazily create a reusable frameless popup widget
     if (!m_toast) {
         m_toast = new QWidget(nullptr,
@@ -471,6 +492,10 @@ void PathBar::showCopiedToast(const QPoint& globalPos) {
         });
     }
 
+    // 更新 toast 文字（默认 "✓ Path copied"，调用方可覆盖如 "✓ 已复制：/foo/bar"）
+    if (auto* label = m_toast->findChild<QLabel*>("toastLabel")) {
+        label->setText(message.isEmpty() ? T("✓ Path copied") : message);
+    }
     m_toast->adjustSize();
     int x = globalPos.x() - m_toast->width() / 2;
     int y = globalPos.y() + 4;

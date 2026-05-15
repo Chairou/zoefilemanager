@@ -51,7 +51,11 @@ protected:
 private:
     void rebuildDisplay();                          // 根据 m_path 重建面包屑
     void clearCrumbs();                             // 移除当前面包屑按钮/分隔符
-    void showCopiedToast(const QPoint& globalPos);  // 顶层无边框小气泡
+    /// 顶层无边框小气泡。
+    /// message 为空时，默认显示 "✓ Path copied"（向后兼容）。
+    /// 调用方可自定义文字（如 "✓ 已复制：/Users/.../foo"）。
+    void showCopiedToast(const QPoint& globalPos,
+                         const QString& message = QString());
     void commitEditedPath();                        // 编辑模式 Enter 处理
 
     QString m_path;

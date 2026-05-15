@@ -29,6 +29,7 @@
 #include <QFileInfo>
 #include <QProgressDialog>
 #include <QProcess>
+#include <QStandardPaths>
 #include <QProxyStyle>
 #include <QDesktopServices>
 #include <QUrl>
@@ -2426,6 +2427,97 @@ void MainWindow::onContextMenu(const QPoint& pos, PanelSide side) {
     }
 
     menu.addAction(TS("Run Script\tCtrl+E"), this, &MainWindow::onRunScript);
+
+    // ---- "Open Shell Here" —— 在当前 active panel 的 cwd 下打开终端窗口 ----
+    // - 仅本地路径可用：远程 SFTP/SMB 没有"本地 shell 概念"，即使能 cd 进 mount
+    //   点也容易混淆，故直接 disable 并加 tooltip 说明。
+    // - macOS 用 AppleScript 驱动 Terminal.app `do script "cd <path>"`，比
+    //   `open -a Terminal <path>` 更可靠（后者在路径含空格/中文时偶有问题）。
+    // - Linux 走 xdg-terminal / gnome-terminal / konsole 顺序探测；找不到时
+    //   弹 information 提示用户手动安装。
+    {
+        QAction* shellAct = menu.addAction(T("在此打开Shell"));
+        const QString cwd = activePanel()->currentPath();
+        const bool isRemote = FileSystemRouter::instance().isRemote(cwd);
+        if (isRemote) {
+            shellAct->setEnabled(false);
+            shellAct->setToolTip(T("Open Shell Here is only available for local paths"));
+        } else {
+            connect(shellAct, &QAction::triggered, this, [this, cwd]() {
+#if defined(Q_OS_MAC)
+                // 强制"新窗口"而非"新 tab"。
+                //
+                // 之前用 `open -a Terminal <dir>`：Apple Event 传 cwd 给
+                // Terminal.app，但 Terminal 是否新开窗口取决于"偏好设置 →
+                // 通用 → 启动时打开"以及当前是否已有窗口；很多用户配置下
+                // 它会复用现有窗口、新增一个 tab，与本需求"完整 shell 窗口"
+                // 不符。
+                //
+                // 改用 osascript 显式 do script —— AppleScript 文档：
+                //   "do script <command>"  → 在新窗口中执行
+                //   "do script <command> in window X" → 在窗口 X 的当前 tab
+                // 不带 in 子句 = 新窗口 = 完整 shell。
+                //
+                // 把 `cd "<path>"` 作为 do script 的命令注入 shell stdin；
+                // shell 启动 RC（.zshrc/.bash_profile）后，prompt 出现，cd
+                // 命令立刻被执行，cwd 变成目标目录。路径中的 \ " 已转义。
+                //
+                // iTerm 走类似 AppleScript（用 create window with default
+                // profile command），不复用 Terminal 路径，确保也是新窗口。
+                QString safe = cwd;
+                safe.replace('\\', "\\\\").replace('"', "\\\"");
+
+                const QString iterm = "/Applications/iTerm.app";
+                QString script;
+                if (QFileInfo(iterm).exists()) {
+                    // iTerm：create window 一定是新窗口
+                    script = QString(
+                        "tell application \"iTerm\"\n"
+                        "  activate\n"
+                        "  create window with default profile command \"/bin/zsh -i -c 'cd \\\"%1\\\" && exec $SHELL -i'\"\n"
+                        "end tell").arg(safe);
+                } else {
+                    // Terminal.app：do script 不带 in = 新窗口
+                    script = QString(
+                        "tell application \"Terminal\"\n"
+                        "  activate\n"
+                        "  do script \"cd \\\"%1\\\"\"\n"
+                        "end tell").arg(safe);
+                }
+                QProcess::startDetached("osascript",
+                    QStringList() << "-e" << script);
+#elif defined(Q_OS_WIN)
+                // Windows：在 cwd 下启动 cmd.exe（带 /K 保留窗口）。
+                QProcess::startDetached("cmd.exe", QStringList() << "/K", cwd);
+#else
+                // Linux：按可用性顺序探测常见终端
+                const QStringList terms = {
+                    "x-terminal-emulator", "gnome-terminal", "konsole",
+                    "xfce4-terminal", "xterm"
+                };
+                bool launched = false;
+                for (const QString& term : terms) {
+                    if (QStandardPaths::findExecutable(term).isEmpty()) continue;
+                    QStringList args;
+                    if (term == "gnome-terminal") {
+                        args << "--working-directory=" + cwd;
+                    } else if (term == "konsole") {
+                        args << "--workdir" << cwd;
+                    } else {
+                        // x-terminal-emulator / xfce4-terminal / xterm: cd 后启 shell
+                        args << "-e" << "sh" << "-c"
+                             << QString("cd \"%1\" && exec $SHELL").arg(cwd);
+                    }
+                    if (QProcess::startDetached(term, args)) { launched = true; break; }
+                }
+                if (!launched) {
+                    QMessageBox::information(this, T("Open Shell Here"),
+                        T("No terminal emulator found. Please install one (e.g. gnome-terminal, konsole)."));
+                }
+#endif
+            });
+        }
+    }
 
     menu.exec(pos);
 }
