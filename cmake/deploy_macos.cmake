@@ -111,6 +111,35 @@ function(_resolve_soname in_path out_real out_soname)
     set(${out_soname} "${_soname}" PARENT_SCOPE)
 endfunction()
 
+# Helper: strip an existing ad-hoc / Developer-ID code signature from a
+# Mach-O file before we call install_name_tool on it.
+#
+# Why: install_name_tool always prints
+#     "warning: changes being made to the file will invalidate the code
+#      signature in: <file>"
+# whenever the file is signed.  Homebrew dylibs (libsmbclient, samba
+# privates, openssl, ...) ship ad-hoc signed, so every load-command
+# rewrite produces this noise.  The warning is harmless because we re-sign
+# everything later, but it clutters the build log to the point where
+# users mistake it for an error.
+#
+# Stripping the signature first is the canonical fix: install_name_tool
+# becomes silent, and our later codesign --force --sign - puts a fresh
+# ad-hoc signature on top.  No-op if the file isn't signed.
+function(_strip_signature path)
+    if(NOT EXISTS "${path}")
+        return()
+    endif()
+    # codesign --remove-signature is silent on success; on "not signed"
+    # files it returns non-zero with a stderr msg — swallow both so this
+    # helper is a true no-op in the unsigned case.
+    execute_process(
+        COMMAND codesign --remove-signature "${path}"
+        OUTPUT_QUIET ERROR_QUIET
+        RESULT_VARIABLE _ignored
+    )
+endfunction()
+
 # Helper: copy a dylib (dereferencing symlinks) into Contents/Frameworks
 # and return the destination path + its soname.
 function(_vendor_dylib in_path out_dest out_soname)
@@ -126,6 +155,9 @@ function(_vendor_dylib in_path out_dest out_soname)
             file(RENAME "${FRAMEWORKS_DIR}/${_copied_name}" "${_dest}")
         endif()
         execute_process(COMMAND chmod u+w "${_dest}")
+        # Strip existing signature so install_name_tool stays quiet (we
+        # re-sign at step 5).  See _strip_signature comment above.
+        _strip_signature("${_dest}")
         execute_process(COMMAND install_name_tool -id "@rpath/${_soname}" "${_dest}")
     endif()
     set(${out_dest} "${_dest}" PARENT_SCOPE)
@@ -195,6 +227,7 @@ function(_rewrite_non_system_deps dylib)
                 # Already vendored — but make sure the ref is on the
                 # canonical @rpath/<soname> form to keep things uniform.
                 if(NOT _dep STREQUAL "@rpath/${_dep_name}")
+                    _strip_signature("${dylib}")
                     execute_process(COMMAND install_name_tool -change
                         "${_dep}" "@rpath/${_dep_name}" "${dylib}")
                 endif()
@@ -223,6 +256,7 @@ function(_rewrite_non_system_deps dylib)
             endif()
             message(STATUS "    rescue: ${_self_name} needs ${_dep_name} (was: ${_dep}) -> vendor from ${_hb_path}")
             _vendor_dylib("${_hb_path}" _dep_dest _dep_soname)
+            _strip_signature("${dylib}")
             execute_process(COMMAND install_name_tool -change
                 "${_dep}" "@rpath/${_dep_soname}" "${dylib}")
             _rewrite_non_system_deps("${_dep_dest}")
@@ -231,6 +265,7 @@ function(_rewrite_non_system_deps dylib)
         # Non-system dep - vendor it (recursively) and rewrite the ref.
         _vendor_dylib("${_dep}" _dep_dest _dep_soname)
         message(STATUS "    patch: ${_self_name}  ${_dep}  ->  @rpath/${_dep_soname}")
+        _strip_signature("${dylib}")
         execute_process(COMMAND install_name_tool -change
             "${_dep}" "@rpath/${_dep_soname}" "${dylib}")
         # Recurse - but only after the copy exists.
@@ -281,6 +316,7 @@ foreach(_line IN LISTS _app_lines)
     get_filename_component(_dep_name "${_dep}" NAME)
     if(_dep_name STREQUAL SSH2_SONAME AND NOT _dep MATCHES "^@")
         message(STATUS "  patch app: ${_dep}  ->  @rpath/${SSH2_SONAME}")
+        _strip_signature("${APP_BINARY}")
         execute_process(COMMAND install_name_tool -change
             "${_dep}" "@rpath/${SSH2_SONAME}" "${APP_BINARY}")
     endif()
@@ -294,6 +330,7 @@ _rewrite_non_system_deps("${SSH2_DEST}")
 # "@executable_path/../Frameworks" so @rpath/libfoo resolves. cmake's
 # INSTALL_RPATH usually does this already, but add_rpath errors if
 # duplicate — ignore failure. ----
+_strip_signature("${APP_BINARY}")
 execute_process(COMMAND install_name_tool -add_rpath
     "@executable_path/../Frameworks" "${APP_BINARY}"
     RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
@@ -322,6 +359,7 @@ if(EXISTS "${_qtdbus_fw}" AND NOT EXISTS "${FRAMEWORKS_DIR}/QtDBus.framework/Ver
 
     set(_qtdbus_bin "${FRAMEWORKS_DIR}/QtDBus.framework/Versions/A/QtDBus")
     execute_process(COMMAND chmod u+w "${_qtdbus_bin}")
+    _strip_signature("${_qtdbus_bin}")
 
     # Rewrite its install id
     execute_process(COMMAND install_name_tool -id
@@ -343,6 +381,10 @@ if(EXISTS "${_qtdbus_fw}" AND NOT EXISTS "${FRAMEWORKS_DIR}/QtDBus.framework/Ver
     set(_dbus_lib "/opt/homebrew/opt/dbus/lib/libdbus-1.3.dylib")
     if(EXISTS "${_dbus_lib}")
         _vendor_dylib("${_dbus_lib}" _dbus_dest _dbus_soname)
+        # _qtdbus_bin already had its signature stripped above, but we
+        # may have re-signed it implicitly via codesign --remove on its
+        # own copy.  Strip again to be safe.
+        _strip_signature("${_qtdbus_bin}")
         execute_process(COMMAND install_name_tool -change
             "/opt/homebrew/opt/dbus/lib/libdbus-1.3.dylib"
             "@rpath/${_dbus_soname}"
@@ -351,6 +393,7 @@ if(EXISTS "${_qtdbus_fw}" AND NOT EXISTS "${FRAMEWORKS_DIR}/QtDBus.framework/Ver
     endif()
 
     # Add rpath to QtDBus binary so it can find sibling frameworks
+    _strip_signature("${_qtdbus_bin}")
     execute_process(COMMAND install_name_tool -add_rpath
         "@executable_path/../Frameworks" "${_qtdbus_bin}"
         RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
@@ -449,6 +492,15 @@ endif()
 
 # The main binary MUST be signed last — after all its deps are final.
 # Use --deep to ensure the entire bundle (including nested frameworks) is valid.
+#
+# Touch the macdeployqt sentinel *before* the final --deep sign so it gets
+# sealed into _CodeSignature/CodeResources.  If we touched it after signing,
+# `codesign --verify --deep --strict` would fail with
+#     "a sealed resource is missing or invalid: file added: .../Contents/.macdeployqt.done"
+# the next time the bundle is verified — and Gatekeeper / launchd would
+# refuse to launch the app on locked-down systems.
+file(TOUCH "${BUNDLE}/Contents/.macdeployqt.done")
+
 execute_process(COMMAND codesign --force --deep --sign - --timestamp=none
     --preserve-metadata=entitlements,requirements,flags "${BUNDLE}"
     RESULT_VARIABLE _rc ERROR_VARIABLE _err)
